@@ -58,6 +58,13 @@ NAME_PAT = re.compile(
     r"_(?P<date>\d{8})(?P<suffix>[A-Za-z]*)\.[A-Za-z]+$")
 
 COL_NAME = "图片名"
+
+# inference.py 写出来的列顺序。**没有表头的 CSV 按这个补名** ——
+# 合并多个 CSV、或用 Excel 另存时，表头很容易丢掉，而列顺序一直是这个。
+DEFAULT_COLUMNS = ["图片名", "根数量", "起点锚定(条)", "总根长(px)", "总根系面积(px²)",
+                   "平均根长(px)", "最长根(px)", "各根长度(px)", "茎面积(px²)",
+                   "检查区面积(px²)", "check_ok", "root_ok",
+                   "总根长(mm)", "总根系面积(mm²)", "平均根长(mm)", "最长根(mm)"]
 # 两个纵坐标指标：(内部键, 图里显示名, 纵轴标题, CSV 列名, 数值格式)
 METRICS = (
     ("len", "根长", "总根长 (px)", "总根长(px)", "{:.1f}"),
@@ -119,14 +126,43 @@ def parse_name(raw: str):
     return (m["kind"], m["num"], m["rep"], m["date"]) if m else None
 
 
+def read_csv_text(path: Path):
+    """按几种编码依次尝试读 CSV，返回 (文本, 实际用的编码)。
+
+    为什么要回退：inference.py 写出来的是**带 BOM 的 UTF-8**（utf-8-sig），
+    但只要用 Excel 打开再另存一次，Excel 就会**丢掉 BOM、并换成本地代码页**
+    （中文 Windows 上是 GBK）—— 再读就报 `UnicodeDecodeError: byte 0xca ...`。
+    gb18030 是 GBK 的超集，能覆盖全部中文字符。
+    """
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    # 两种都不行（编码很怪）：latin-1 对任何字节都不抛异常，至少能读进来，
+    # 但中文会变乱码 —— 交由调用方在输出里提示。
+    return raw.decode("latin-1"), "latin-1（兜底，中文可能乱码）"
+
+
 def load_csv(path: Path, keep_bad: bool):
     """读 CSV -> {(方式,编号,重复): {日期: {指标: 值}}}，外加统计信息。"""
-    text = path.read_text(encoding="utf-8-sig")
-    rows = list(csv.DictReader(text.splitlines()))
-    fieldnames = list(rows[0].keys()) if rows else []
+    text, enc = read_csv_text(path)
+    raw_rows = [r for r in csv.reader(text.splitlines())
+                if r and any(c.strip() for c in r)]
+    if not raw_rows:
+        raise SystemExit(f"[错误] {path.name} 是空的（或只有空行）")
+    if COL_NAME in raw_rows[0]:
+        fieldnames, body = raw_rows[0], raw_rows[1:]
+        no_header = False
+    else:
+        # **没有表头**：合并多个 CSV、或 Excel 另存，都很容易把表头丢掉。
+        # 按 inference.py 的列顺序补一个；列数对不上时 zip 自动截断，取值不受影响。
+        fieldnames, body, no_header = DEFAULT_COLUMNS, raw_rows, True
+    rows = [dict(zip(fieldnames, r)) for r in body]
     data = defaultdict(lambda: defaultdict(dict))
     st = {"总行数": 0, "跳过不可信": 0, "文件名无法解析": 0, "数值无法解析": 0,
-          "重复点": [], "含空格": 0}
+          "重复点": [], "含空格": 0, "编码": enc, "无表头": no_header}
     cleaned = []
     for r in rows:
         st["总行数"] += 1
@@ -384,6 +420,15 @@ def main():
         print(f"  共 {st['总行数']} 行 | 处理方式 {kinds} | 编号 {len(nums)} 个 | 重复 {all_reps}"
               + (f" | 跳过不可信 {st['跳过不可信']} 行" if st["跳过不可信"] else "")
               + (f" | 文件名无法解析 {st['文件名无法解析']} 行" if st["文件名无法解析"] else ""))
+        # 非 UTF-8 时明确报出来：多半是 Excel 另存过一次（BOM 丢了、换成 GBK）
+        if st["编码"] != "utf-8-sig":
+            print(f"  [提示] 这个 CSV 是 **{st['编码']}** 编码（不是 inference.py 写的 UTF-8+BOM），"
+                  f"已按 {st['编码']} 读入。多半是用 Excel 打开后另存过 —— 不影响本次读取，"
+                  f"但文件名里的中文若有异常，请核对一下。")
+        if st["无表头"]:
+            print("  [提示] 这个 CSV **没有表头行**，已按 inference.py 的列顺序"
+                  "（图片名/根数量/…/check_ok/root_ok）认列。合并 CSV 时容易丢掉表头 —— "
+                  "不影响本次读取。")
         if len(kinds) > 1 and not compare:
             print(f"  {len(kinds)} 种处理方式各画一套；想叠进同一张图对比，用 "
                   f"--compare {','.join(kinds[:2])}")

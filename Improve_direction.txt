@@ -1,5 +1,0 @@
-0.现在我只需要总根长和总根系面积即可
-1.inference.py 结果的图片只保存overlay，不要check和stem，mask图片则默认不保存，当需要时再保存
-2.更新数据集:将旧数据集删掉，从"C:\Users\21215\Desktop\数据集总表\root"里加载数据集到D:\python projects\Deep_learning_model_for_sugarcane\datasets\root ；以后我只保证数据集里每张图都会有根系标注的.rsml文件，但是不保证会有标注check_background和stem的.json文件，需要训练两个模型分别识别other和root的标注吗?
-3.更新tool里的separate_dataset
-4.优化analysis_datas：root_C001-1_20241229CK.jpg 提取出 C 作为出来方式 001 为编号 -1 为重复次序。添加一个参数--compare C，P 即同一编号的001，两个处理C和P（也可以是C和S）放到同一个图片里比较，即一个图有八个折线分别是C001-1,C001-2,C001-3,C001-4,P001-1,P001-2,P001-3,P001-4.制作两份图折线图,一个是纵坐标是总跟长，另一个图的纵坐标是根面积 
