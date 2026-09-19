@@ -168,7 +168,7 @@ EPOCHS = 5000             # 只是轮数上限。现在是 ReduceLROnPlateau，�
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 
-# 学习率调度：验证 Dice 连续 LR_PATIENCE 轮不提升 → LR × LR_FACTOR（下限 MIN_LR）。
+# 学习率调度：联合 Dice 连续 LR_PATIENCE 轮不提升 → LR × LR_FACTOR（下限 MIN_LR）。
 # 原来用的是 CosineAnnealingLR(T_max=EPOCHS=5000)，但早停总在一两百轮就结束，
 # 于是余弦一次都没走到：实测 model_202609151106 第 1/83/143 轮的 LR 分别是
 # 0.001000 / 0.000999 / 0.000998 —— **全程恒定 1e-3**，等于没退火。
@@ -178,7 +178,8 @@ WEIGHT_DECAY = 1e-4
 LR_PATIENCE = 25          # 必须 < PATIENCE：先降 LR，降完还不行才谈早停
 LR_FACTOR = 0.5
 MIN_LR = 1e-5
-PATIENCE = 120            # 验证 Dice 连续 N 轮无提升则提前停止（只看根系通道）
+PATIENCE = 120            # 联合 Dice 连续 N 轮无提升则提前停止（判据见 train.py 的 select_dice：
+                          # min(根系 Dice, 茎 Dice)，茎没练好时不会被误判成最优）
                           # （原 60 → 120：配合上面的 LR 衰减，给降 LR 之后留出反应时间）
 VAL_SIZE = 4              # 验证集**植株数**：同一植株的所有时点整组进同一侧，避免同株泄漏
                           # （当前数据 train 共 24 组 / 18 植株，4 植株 ≈ 6 张 ≈ 25%，与 test 的 23% 相称）

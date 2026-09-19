@@ -6,8 +6,13 @@
     python train/train.py --size 1536 --batch 8  # 部署到 4xRTX3090 服务器时
 
 每轮输出：轮次 / 损失 / 验证Dice（根系通道） / 本轮耗时(s)（控制台 + 模型文件夹内日志），
-行尾另附茎与检查范围通道的 Dice。模型保存：model/model_YYYYMMDDHHMM/
-（验证最优轮权重 .pth + 参数日志 .txt + hparams.json）
+行尾另附茎与检查范围通道的 Dice 与**联合指标** `select_dice`。
+模型保存：model/model_YYYYMMDDHHMM/（验证最优轮权重 .pth + 参数日志 .txt + hparams.json）
+
+**保存 / 早停 / 降 LR 用同一个判据：联合指标 = min(根系 Dice, 茎 Dice)**，
+不是单看根系通道 —— 根系先到峰值、茎后收敛，只看根系会存下「根已到顶、茎还没练好」
+的权重；而测试管线的起点锚定依赖茎，茎塌了会把 root Dice 一起拖垮（2026-09-19 实测
+踩到，详见 README 的「选模型判据」一节）。茎已收敛时 min ≡ 根系 Dice，判据与过去一致。
 
 数据划分**按植株整组进出**（同一植株的不同时点不会分处训练/验证两侧），
 `--val-size` 是验证集**植株数**。
@@ -126,9 +131,9 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=config.EPOCHS)
     p.add_argument("--lr", type=float, default=config.LR)
     p.add_argument("--patience", type=int, default=config.PATIENCE,
-                   help="验证 Dice 连续 N 轮无提升则早停（应 > --lr-patience）")
+                   help="联合 Dice 连续 N 轮无提升则早停（应 > --lr-patience）")
     p.add_argument("--lr-patience", type=int, default=config.LR_PATIENCE,
-                   help="验证 Dice 连续 N 轮无提升则 LR 减半（默认见 config.LR_PATIENCE）")
+                   help="联合 Dice 连续 N 轮无提升则 LR 减半（默认见 config.LR_PATIENCE）")
     p.add_argument("--val-size", type=int, default=config.VAL_SIZE,
                    help="验证集植株数（同植株的全部时点整组进同一侧）")
     p.add_argument("--seed", type=int, default=config.SEED)
@@ -293,9 +298,12 @@ def main():
     log(f"[信息] 模型目录: {folder}")
 
     # ---- 训练循环 ----
-    best_val_dice, best_epoch = -1.0, -1
+    # best_select = 保存判据（联合指标），best_root/best_stem = 那一轮的逐通道值（只为日志）
+    best_select, best_root, best_stem, best_epoch = -1.0, -1.0, -1.0, -1
     bad_epochs = 0
     epoch, val_dice = 0, -1.0
+    # 先摆一份默认值：第一轮验证之前就 Ctrl-C 的话，异常分支里要用到它
+    per_ch_dice = [-1.0] * N_CH
     t_start = time.time()
     try:
         for epoch in range(1, args.epochs + 1):
@@ -346,7 +354,7 @@ def main():
                 n_batch += 1
             train_loss = loss_sum / max(n_batch, 1)
 
-            # ---- 验证（轮内）：逐通道 Dice/IoU，早停只看根系通道 ----
+            # ---- 验证（轮内）：逐通道 Dice/IoU，早停/保存按联合指标（见下面 select_dice）----
             val_dice = val_iou = -1.0
             per_ch_dice = [-1.0] * N_CH
             if val_ds:
@@ -385,11 +393,27 @@ def main():
                     per_ch_iou = [float(-1.0 if np.isnan(v) else v) for v in per_ch_iou]
                     val_dice, val_iou = per_ch_dice[0], per_ch_iou[0]
 
-            improved = val_dice - best_val_dice > 1e-4
+            # ---- 选模型 / 早停 / 调 LR 的判据：联合指标 = min(root_dice, stem_dice) ----
+            # 为什么不单看根系通道（2026-09-19 实测踩到）：根系 Dice 先到峰值、茎通道后
+            # 收敛，两者的时间窗错开。只盯根系就会存下「根系峰值已到、茎还没练好」的权重，
+            # 而测试管线的**起点锚定依赖茎预测** —— 茎一塌，根系追踪锚不上起点，
+            # root Dice 反而被拖垮，看日志却以为是大分辨率不行。
+            # （实测：某个 2048 的模型存于 ep120，stem 仅 0.3220 → 测试 root 0.4267；
+            #   同期 1024 的模型 stem 0.9133 → 测试 root 0.5014。详见 README「选模型判据」。）
+            # 用 min 而不是加权和：茎练好后（~0.94）恒高于根系（~0.43），此时
+            # min ≡ root_dice，判据与过去完全一致；只有茎塌到比根系还低时才顶替它，
+            # 正好卡住要防的那一种情况，且不用另外拍一个权重系数。
+            # 茎在验证集里没标注时 per_ch_dice[1] == -1，退回单看根系。
+            stem_dice = per_ch_dice[1] if N_CH > 1 else -1.0
+            select_dice = min(val_dice, stem_dice) if stem_dice >= 0.0 else val_dice
+
+            improved = select_dice - best_select > 1e-4
             if improved:
-                best_val_dice, best_epoch = val_dice, epoch
+                best_select, best_root, best_stem = select_dice, val_dice, stem_dice
+                best_epoch = epoch
                 torch.save({"state_dict": model.state_dict(), "epoch": epoch,
-                            "val_dice": val_dice, "hparams": hparams,
+                            "val_dice": val_dice, "select_dice": select_dice,
+                            "stem_dice": stem_dice, "hparams": hparams,
                             "out_ch": N_CH, "norm": args.norm,
                             "class_names": list(config.CLASS_NAMES)},
                            ckpt_path)
@@ -400,11 +424,13 @@ def main():
             dt = time.time() - t_ep
             note = ""
             if val_ds:
-                # 无验证集时 val_dice 恒为 -1，不能喂给调度器（会把 LR 一路降到下限）
-                scheduler.step(val_dice)
+                # 无验证集时指标恒为 -1，不能喂给调度器（会把 LR 一路降到下限）。
+                # 喂联合指标而不是 val_dice：三者（保存 / 早停 / 降 LR）对「模型好不好」
+                # 必须是同一个定义，否则会出现「早停判据说在变好、调度器判据说没变」。
+                scheduler.step(select_dice)
                 new_lr = optimizer.param_groups[0]["lr"]
                 if new_lr < cur_lr:
-                    note = (f"\n[学习率] 验证 Dice 连续 {args.lr_patience} 轮未提升："
+                    note = (f"\n[学习率] 联合 Dice 连续 {args.lr_patience} 轮未提升："
                             f"{cur_lr:.2e} → {new_lr:.2e}")
                     cur_lr = new_lr
             extra = "".join(f" {n}_dice={d:.4f}"
@@ -423,22 +449,27 @@ def main():
                 f"val_dice={val_dice:.4f} val_iou={val_iou:.4f} time={dt:.1f}s"
                 f" lr={cur_lr:.2e}" + cd_str
                 + extra
+                + (f" select_dice={select_dice:.4f}" if val_ds else "")
                 + (" *best*" if improved else "") + note)
 
             if bad_epochs >= args.patience and epoch >= 10:
-                log(f"[提前停止] 连续 {args.patience} 轮验证 Dice 未提升，停止训练。")
+                log(f"[提前停止] 连续 {args.patience} 轮联合 Dice 未提升，停止训练。")
                 break
     except KeyboardInterrupt:
         log("[中断] 收到 Ctrl-C，保存已训练到当前轮的模型权重。")
+        _stem_now = per_ch_dice[1] if N_CH > 1 else -1.0
         torch.save({"state_dict": model.state_dict(), "epoch": epoch,
-                    "val_dice": val_dice, "hparams": hparams,
+                    "val_dice": val_dice,
+                    "select_dice": min(val_dice, _stem_now) if _stem_now >= 0.0 else val_dice,
+                    "stem_dice": _stem_now, "hparams": hparams,
                     "out_ch": N_CH, "norm": args.norm,
                     "class_names": list(config.CLASS_NAMES)},
                    ckpt_path)
 
     total = time.time() - t_start
     if best_epoch > 0:
-        log(f"[完成] 最佳轮次: epoch {best_epoch} | 验证 Dice(根系) {best_val_dice:.4f} | "
+        log(f"[完成] 最佳轮次: epoch {best_epoch} | 联合 Dice {best_select:.4f}"
+            f"（根系 {best_root:.4f} / 茎 {best_stem:.4f}） | "
             f"模型已保存: {ckpt_path}")
     else:
         log(f"[完成] 模型已保存: {ckpt_path}")
