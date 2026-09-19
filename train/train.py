@@ -9,10 +9,11 @@
 行尾另附茎与检查范围通道的 Dice 与**联合指标** `select_dice`。
 模型保存：model/model_YYYYMMDDHHMM/（验证最优轮权重 .pth + 参数日志 .txt + hparams.json）
 
-**保存 / 早停 / 降 LR 用同一个判据：联合指标 = min(根系 Dice, 茎 Dice)**，
-不是单看根系通道 —— 根系先到峰值、茎后收敛，只看根系会存下「根已到顶、茎还没练好」
-的权重；而测试管线的起点锚定依赖茎，茎塌了会把 root Dice 一起拖垮（2026-09-19 实测
-踩到，详见 README 的「选模型判据」一节）。茎已收敛时 min ≡ 根系 Dice，判据与过去一致。
+**保存 / 早停 / 降 LR 用同一个判据 `select_dice`**，不是单看根系通道：
+把**茎当准入门槛** —— 茎 ≥ `config.STEM_MIN_DICE` 时判据就是纯根系 Dice（与历史行为
+一致），达不到才按缺口打折。防的是「根已到顶、茎还没练好」的权重：测试管线的起点
+锚定依赖茎，茎塌了会把 root Dice 一起拖垮。常数依据见 `config.py`，完整来龙去脉
+（含一个"这个数据规模测不出 0.02 以下差异"的教训）见 README 的「选模型判据」一节。
 
 数据划分**按植株整组进出**（同一植株的不同时点不会分处训练/验证两侧），
 `--val-size` 是验证集**植株数**。
@@ -26,6 +27,7 @@ import json
 import random
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -137,6 +139,10 @@ def parse_args():
     p.add_argument("--val-size", type=int, default=config.VAL_SIZE,
                    help="验证集植株数（同植株的全部时点整组进同一侧）")
     p.add_argument("--seed", type=int, default=config.SEED)
+    p.add_argument("--pos-weight", default=None,
+                   help="逐通道 BCE 正样本权重，逗号分隔、顺序同 CLASS_NAMES"
+                        "（如 3,10,1；默认见 config.LOSS_POS_WEIGHT）。"
+                        "走命令行是为了做损失实验时不用改 config，实验值也会记进 hparams.json")
     p.add_argument("--data-dir", type=Path, default=config.TRAIN_DATA_DIR)
     p.add_argument("--out-dir", type=Path, default=config.MODEL_DIR)
     p.add_argument("--norm", default=config.NORM, choices=("group", "batch"),
@@ -181,6 +187,18 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # 逐通道正样本权重：命令行优先，否则用 config。长度必须与 CLASS_NAMES 对齐，
+    # 否则 pos_weight 会广播到错误的通道上（错得不明显，只是学得不对）。
+    pos_weight = config.LOSS_POS_WEIGHT
+    if args.pos_weight:
+        try:
+            pos_weight = tuple(float(v) for v in args.pos_weight.split(","))
+        except ValueError:
+            sys.exit(f"[错误] --pos-weight 解析失败: {args.pos_weight}（应为 3,10,1 这样的形式）")
+        if len(pos_weight) != N_CH:
+            sys.exit(f"[错误] --pos-weight 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
+                     f"当前 {len(pos_weight)} 个: {args.pos_weight}")
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available()
                           else "cuda")
@@ -242,7 +260,7 @@ def main():
     amp = (device.type == "cuda") and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     # 逐通道正样本加权，(1,C,1,1) 对应 (B,C,H,W) 的通道维（见 config.LOSS_POS_WEIGHT）
-    pos_w = torch.as_tensor(config.LOSS_POS_WEIGHT, dtype=torch.float32,
+    pos_w = torch.as_tensor(pos_weight, dtype=torch.float32,
                             device=device).view(1, N_CH, 1, 1)
     # clDice 只对权重非零的通道计算（软骨架迭代贵，别浪费在茎/检查范围上）
     cld_chans = [c for c, w in enumerate(config.LOSS_CLDICE_W)
@@ -265,7 +283,7 @@ def main():
                     "norm": args.norm,
                     "loss_bce_w": list(config.LOSS_BCE_W),
                     "loss_dice_w": list(config.LOSS_DICE_W),
-                    "loss_pos_weight": list(config.LOSS_POS_WEIGHT),
+                    "loss_pos_weight": list(pos_weight),
                     "loss_cldice_w": list(config.LOSS_CLDICE_W),
                     "cldice_iters": config.CLDICE_ITERS,
                     "params_M": round(n_params / 1e6, 2),
@@ -289,7 +307,7 @@ def main():
         f"epochs {args.epochs} | 训练 {len(train_names)} 组 | "
         f"验证 {len(val_names)} 组({len(val_plants)} 植株)")
     log(f"[信息] 通道 {config.CLASS_NAMES} | BCE权重 {config.LOSS_BCE_W} | "
-        f"Dice权重 {config.LOSS_DICE_W} | 正样本权重 {config.LOSS_POS_WEIGHT}")
+        f"Dice权重 {config.LOSS_DICE_W} | 正样本权重 {pos_weight}")
     log(f"[信息] 学习率 {args.lr} | 平台期 {args.lr_patience} 轮不减半就 ×{config.LR_FACTOR}"
         f"（下限 {config.MIN_LR}）| 早停 {args.patience} 轮")
     log(f"[信息] clDice 拓扑损失: "
@@ -302,8 +320,10 @@ def main():
     best_select, best_root, best_stem, best_epoch = -1.0, -1.0, -1.0, -1
     bad_epochs = 0
     epoch, val_dice = 0, -1.0
-    # 先摆一份默认值：第一轮验证之前就 Ctrl-C 的话，异常分支里要用到它
+    # 先摆一份默认值：第一轮验证之前就 Ctrl-C 的话，异常分支里要用到它们
     per_ch_dice = [-1.0] * N_CH
+    select_dice = -1.0
+    score_hist = deque(maxlen=max(config.SELECT_SMOOTH, 1))
     t_start = time.time()
     try:
         for epoch in range(1, args.epochs + 1):
@@ -393,21 +413,31 @@ def main():
                     per_ch_iou = [float(-1.0 if np.isnan(v) else v) for v in per_ch_iou]
                     val_dice, val_iou = per_ch_dice[0], per_ch_iou[0]
 
-            # ---- 选模型 / 早停 / 调 LR 的判据：联合指标 = min(root_dice, stem_dice) ----
+            # ---- 选模型 / 早停 / 调 LR 的判据：select_dice ----
             # 为什么不单看根系通道（2026-09-19 实测踩到）：根系 Dice 先到峰值、茎通道后
-            # 收敛，两者的时间窗错开。只盯根系就会存下「根系峰值已到、茎还没练好」的权重，
-            # 而测试管线的**起点锚定依赖茎预测** —— 茎一塌，根系追踪锚不上起点，
+            # 收敛，两者高峰错开一整段。只盯根系就会存下「根系峰值已到、茎还没练好」的
+            # 权重，而测试管线的**起点锚定依赖茎预测** —— 茎一塌，根系追踪锚不上起点，
             # root Dice 反而被拖垮，看日志却以为是大分辨率不行。
-            # （实测：某个 2048 的模型存于 ep120，stem 仅 0.3220 → 测试 root 0.4267；
-            #   同期 1024 的模型 stem 0.9133 → 测试 root 0.5014。详见 README「选模型判据」。）
-            # 用 min 而不是加权和：茎练好后（~0.94）恒高于根系（~0.43），此时
-            # min ≡ root_dice，判据与过去完全一致；只有茎塌到比根系还低时才顶替它，
-            # 正好卡住要防的那一种情况，且不用另外拍一个权重系数。
+            #
+            # **茎当准入门槛**：茎 ≥ config.STEM_MIN_DICE 就纯看根系 Dice；达不到就按缺口
+            # 打折、排到后面去。不用 min()：min 只在茎**低于**根系时才保护，而茎在 root
+            # 峰值附近常见的取值是 0.4~0.6 —— 高于根系却远没练好，min 会放它过去
+            # （实测：root 0.4075 / stem 0.4902 被选中，测试总长误差翻倍）。
+            # 门槛常数的取值依据见 config.STEM_MIN_DICE。
             # 茎在验证集里没标注时 per_ch_dice[1] == -1，退回单看根系。
             stem_dice = per_ch_dice[1] if N_CH > 1 else -1.0
-            select_dice = min(val_dice, stem_dice) if stem_dice >= 0.0 else val_dice
+            if stem_dice >= 0.0:
+                score_now = val_dice * min(1.0, stem_dice / config.STEM_MIN_DICE)
+            else:
+                score_now = val_dice
+            # 滑动平均：窗口 >1 才起作用，默认 1（试过 10，没有证据支持有用，
+            # 见 config.SELECT_SMOOTH 里记的教训）
+            score_hist.append(score_now)
+            select_dice = sum(score_hist) / len(score_hist)
+            # 窗口没攒满先不比：否则头几轮的「平均」只是两三个数，会假性判优、存下废权重
+            ready = len(score_hist) == score_hist.maxlen
 
-            improved = select_dice - best_select > 1e-4
+            improved = ready and select_dice - best_select > 1e-4
             if improved:
                 best_select, best_root, best_stem = select_dice, val_dice, stem_dice
                 best_epoch = epoch
@@ -457,11 +487,10 @@ def main():
                 break
     except KeyboardInterrupt:
         log("[中断] 收到 Ctrl-C，保存已训练到当前轮的模型权重。")
-        _stem_now = per_ch_dice[1] if N_CH > 1 else -1.0
         torch.save({"state_dict": model.state_dict(), "epoch": epoch,
                     "val_dice": val_dice,
-                    "select_dice": min(val_dice, _stem_now) if _stem_now >= 0.0 else val_dice,
-                    "stem_dice": _stem_now, "hparams": hparams,
+                    "select_dice": select_dice,
+                    "stem_dice": per_ch_dice[1] if N_CH > 1 else -1.0, "hparams": hparams,
                     "out_ch": N_CH, "norm": args.norm,
                     "class_names": list(config.CLASS_NAMES)},
                    ckpt_path)
