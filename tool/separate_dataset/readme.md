@@ -15,7 +15,7 @@
 
 **划分单位默认是「植株」而不是单个文件**：同一植株的多个时点整株进同一侧
 （`plant_ S062-1_20251116ST` 和 `..._20251126ST` 是同一株的两个时点，分到两边就是同株泄漏）。
-植株识别用 [common/dataset.py](../common/dataset.py) 的 `plant_key`。想按单个文件划分加 `--by-file`。
+植株识别用 [common/dataset.py](../../common/dataset.py) 的 `plant_key`。想按单个文件划分加 `--by-file`。
 
 无论按哪种单位，**同名的图片/rsml/json 永远在一组、不会被拆散** —— 拆散会导致训练时
 整组数据被丢掉（`discover_pairs` 要求图片与同名 `.rsml` 在同一侧）。
@@ -57,7 +57,7 @@ python tool\separate_dataset\separate_dataset.py --dir "C:\Users\21215\Desktop\R
 | `--test` | 否 | 测试集比例，默认 0.2 |
 | `--val` | 否 | 验证集比例，**默认 0（不分配，也不会建空的 val 文件夹）** |
 | `--out` | 否 | 输出目录，默认 `<源文件夹同级>/<源文件夹名>_split`（重名自动加 `-1`） |
-| `--seed` | 否 | 随机种子，默认 42（与 [config.py](../config.py) 的 `SEED` 一致） |
+| `--seed` | 否 | 随机种子，默认 42（与 [config.py](../../config.py) 的 `SEED` 一致） |
 | `--move` | 否 | 移动文件而不是复制（默认复制，源数据保留） |
 | `--dry-run` | 否 | 只预览划分结果，不写任何文件 |
 
@@ -117,7 +117,7 @@ copy <输出目录>\train\*   datasets\root\train\
 copy <输出目录>\test\*    datasets\root\test\
 ```
 
-即 [config.py](../config.py) 里的 `TRAIN_DATA_DIR` / `TEST_DATA_DIR`。
+即 [config.py](../../config.py) 里的 `TRAIN_DATA_DIR` / `TEST_DATA_DIR`。
 
 > **注意：本项目的数据集目录已经改成「图片与标注分开放」**（本工具的输出仍是混放，
 > 与本项目当前布局不同）：

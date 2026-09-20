@@ -19,7 +19,8 @@
 | `datasets/` 数据集 | ❌ 不进 | **手动**（U 盘 / rsync / 网盘） |
 | `model/` 模型权重 | ❌ 不进 | 手动；每个 `.pth` 119MB，**超 GitHub 单文件 100MB 硬限制** |
 | `result/`、`inference_pictures/` | ❌ 不进 | 手动 |
-| `experimental_report/`、`.claude/`、`.vscode/` | ❌ 不进 | 不需要同步 |
+| `experimental_reports/` 实验报告 | ❌ 不进 | 研究产物，不进代码仓库（含插图与归档） |
+| `.claude/`、`.vscode/` | ❌ 不进 | 不需要同步 |
 
 > **一句话**：Git 只管代码。数据集和模型永远走别的通道。
 > 规则都写在 [.gitignore](.gitignore) 里，别去改它。

@@ -8,10 +8,15 @@
 # 加前导斜杠即锚定到仓库根，只忽略根目录那一份。
 /analysis_datas/
 /datasets/
-/experimental_report/
 /model/
 /inference_pictures/
 /result/
+
+# ===== 实验报告 =====
+# **整个目录都不入库** —— 报告与插图属于研究产物，不进代码仓库。
+# （曾经只忽略 figures/、正文和脚本入库；2026-09-20 改为整目录忽略。）
+# 前导斜杠锚定到仓库根，不会误伤别处同名的目录。
+/experimental_reports/
 
 # ===== Python =====
 __pycache__/

@@ -2,8 +2,8 @@
 
 2026-09-14 起本项目**不再区分一级/二级根**（只统计根系总数与总长），
 inference.py / test.py / tool/tune_stats 都已不再调用本模块。文件保留是因为
-experimental_report/实验报告.md 里「主根/侧根口径与实测精度」的结论引用它，
-删除代码容易、删除结论难。新流程请直接用 common.skeleton_stats 的统计量。
+experimental_reports/experimental_report_20260911_归档/实验报告.md 里「主根/侧根口径与实测精度」
+的结论引用它，删除代码容易、删除结论难。新流程请直接用 common.skeleton_stats 的统计量。
 
 ----- 以下为原说明 -----
 

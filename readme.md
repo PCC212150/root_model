@@ -5,7 +5,11 @@
 
 > 2026-09-14 起：模型输出由「根系二分类」改为**三通道多标签**（根系 / 茎横截面 / 检查范围）；
 > 推理结果由 txt 改为 **csv**（Excel 可直接打开）；并且**不再区分一级/二级根**。
-> 旧的主根/侧根口径与实测结论保留在 [experimental_report/实验报告.md](experimental_report/实验报告.md)。
+> 旧的主根/侧根口径与实测结论保留在本地
+> `experimental_reports/experimental_report_20260911_归档/实验报告.md`（2026-09-20 归档）；
+> 最新报告在 `experimental_reports/experimental_report_20260920/`。
+> **`experimental_reports/` 整个目录不入库**（见 [.gitignore](.gitignore)），
+> 所以这里只写路径、不做链接 —— 网页上点不开。
 
 # 多模型集成
 --model 现在支持逗号分隔，推理时对概率图取平均再走同一套后处理：
