@@ -365,7 +365,12 @@ def anchor_paths_to_stem(paths, lengths, stem_mask, factor: float = 6.0,
 
     茎外那圈黑色泡沫/海绵环在图像上不是根（模型判成背景是对的），标注却是从茎边开始
     画的折线 —— 也就是**那一段本来就存在，只是被挡住看不见**。这一步把预测折线的起点
-    沿直线补到茎上，使每条根都从茎发出，长度也计入补回的这一段（与标注口径一致）。
+    沿直线补到茎上，使每条根都从茎发出，长度也计入补回的这一段。
+
+    **注意（2026-09-22 更正）**：这里原来写的是「与标注口径一致」，**那句是错的**。
+    实测真值折线的端点距茎中位 27~490px（跨图差 18 倍），也就是标注起点**并不**在茎边。
+    所以这一步**单边加长了预测**，与真值不同口径 —— 拿它和未锚定的真值比会系统性高估。
+    要两侧可比，真值侧必须走 anchor_roots_to_stem（见下面那个函数）。
 
     折线会按「起点在茎上」重新定向：锚定的那一端被放到首位，并把茎上的最近点插为首点。
     两端都离茎超过阈值的折线原样保留（当作独立根计入，不丢信息）。
@@ -408,6 +413,96 @@ def anchor_paths_to_stem(paths, lengths, stem_mask, factor: float = 6.0,
             m["anchored"] = True
             out_metas.append(m)
     return out_paths, out_lengths, n_anchored, (out_metas if metas is not None else None)
+
+
+def continuation_flags(roots, max_gap: float = 150.0, max_angle: float = 30.0) -> list:
+    """标记哪些 RSML 折线是「上一条的续接」（**交叉处断开重画**留下的碎片）。
+
+    用户的标注习惯（2026-09-22 确认）：根系交叉之后，看不出后续是哪个根，所以
+    在交叉处断开、交叉过后另起一条重新画。于是**一条物理根 = 多条折线 = 多个 ID**。
+    实测 plant_ S068-4_20251126ST 的 114 个 ID 里有 103 个是续接。
+
+    判据：存在另一条折线 j，使 `end(j) → start(i)` 的距离 <= max_gap，且方向连续
+    （夹角 < max_angle）。两个条件缺一不可 —— 只看距离会把「都从茎边发出、起点挨得近」
+    的无关根误判；只看方向会把「恰好平行」的误判。
+
+    **阈值是启发式的、没有干净解**：实测缺口距离分布是 20~400px 连续、无双峰
+    （中位 111px），因为缺口宽度 = 压在上面那根根的宽度 + 标注时的随手留白，跨图不一样。
+    所以这个函数**只用来抑制锚定**（宁可漏锚，也不要给中段凭空加几百像素），
+    不要拿它当「根数」的口径用 —— 根数在这份数据上不可靠，见 tool/chain_diag/readme.md。
+    """
+    n = len(roots)
+    flags = [False] * n
+    pts = [np.asarray(r.points, dtype=np.float64) for r in roots]
+    for i in range(n):
+        if len(pts[i]) < 2:
+            continue
+        d_in = pts[i][0] - pts[i][1]
+        nrm = float(np.linalg.norm(d_in))
+        if nrm < _EPS:
+            continue
+        d_in = d_in / nrm
+        for j in range(n):
+            if i == j or len(pts[j]) < 2:
+                continue
+            gap = float(np.linalg.norm(pts[j][-1] - pts[i][0]))
+            if gap > max_gap:
+                continue
+            d_out = pts[j][-1] - pts[j][-2]
+            nrm = float(np.linalg.norm(d_out))
+            if nrm < _EPS:
+                continue
+            cos = float(np.dot(d_out / nrm, d_in))
+            if np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))) < max_angle:
+                flags[i] = True
+                break
+    return flags
+
+
+def anchor_roots_to_stem(roots, stem_mask, factor: float = 6.0,
+                         min_px: float = 250.0, max_px: float = 600.0,
+                         max_gap: float = 150.0, max_angle: float = 30.0) -> tuple:
+    """把 **RSML 真值折线**按「起点锚定到茎」的口径补长，返回 (总长, 锚定条数)。
+
+    **当前 `test.py` 走的是另一条路线**（真值掩码 → analyze_mask_anchored），因为
+    那条路与预测侧是**逐字同一个函数**，口径不可能漂。本函数是**折线路线**的备选实现，
+    保留用于交叉校验：两条路线在 11 张测试图上给出 +8.9%（折线）vs +7.5%（掩码），
+    差 1.4 个百分点，互相印证。**要改锚定口径时，两条都跑一遍看是否仍然一致。**
+
+
+    为什么真值也要锚：实测（2026-09-22，tool/chain_diag）证明
+
+        GT 折线端点距茎中位 27~490px（跨图差 18 倍），锚定却用固定阈值
+        clamp(6×r_eq, 250, 600)=600px —— 也就是**标注起点并不在茎边**。
+        于是同一条流水线跑真值掩码 vs 模型掩码，真值 −3.4%、模型 +7.5%，
+        差的这 10.9 个百分点全是锚定，不是模型。
+
+    所以「用锚定」这个决定要求**两侧同口径**：预测补的那段，真值也得补。
+    不补的话任何误差数字都混了口径差。
+
+    走的是与预测侧**同一个** anchor_paths_to_stem，只是输入换成 RSML 折线，
+    所以两边不会漂。roots 只要有 .points 与 .length 即可（鸭子类型）。
+
+    **续接片段不锚**（见 continuation_flags）：标注在交叉处断开重画，中段碎片的起点
+    在交叉点而不是茎上，把它们也锚过去等于凭空加几百像素。实测不抑制的话
+    plant_ S068-4_20251126ST 会被推到 +88%（21228 → 39925），抑制后回到合理量级。
+    """
+    lengths = [float(r.length) for r in roots]
+    if stem_mask is None or not stem_mask.any() or not roots:
+        return float(sum(lengths)), 0
+    cont = continuation_flags(roots, max_gap=max_gap, max_angle=max_angle)
+    paths, keep, skipped = [], [], 0.0
+    for r, c, L in zip(roots, cont, lengths):
+        if c:                     # 续接片段：原样计入，不锚
+            skipped += L
+            continue
+        paths.append(list(r.points))
+        keep.append(L)
+    if not paths:
+        return float(sum(lengths)), 0
+    _, out_lengths, n, _ = anchor_paths_to_stem(
+        paths, keep, stem_mask, factor=factor, min_px=min_px, max_px=max_px)
+    return float(sum(out_lengths)) + skipped, n
 
 
 def _decimate(pts, spacing):
