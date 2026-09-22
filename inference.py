@@ -253,6 +253,8 @@ def main():
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
+    # 切片训练的模型必须显式给 --size（权重里记的 size 是块边长，不是推理尺度）
+    ckpt.require_explicit_size(metas, size_arg, names)
     meta = metas[0]
     tag = f"集成 {len(names)} 个" if len(names) > 1 else "模型"
     print(f"{tag}: {' + '.join(names)} | 设备: {device} | 输出 {meta['out_ch']} 通道"

@@ -168,6 +168,8 @@ def main():
     size = args.size or config.MAX_SIDE
     if not args.gt_mask:
         model, folder, meta = load_model(args.model, device)
+        # 切片训练的模型必须显式给 --size（权重里记的 size 是块边长，不是推理尺度）
+        ckpt.require_explicit_size([meta], args.size, [folder.name])
         size = args.size or meta.get("size") or config.MAX_SIDE
         print(f"模型: {folder.name} | 设备: {device} | 输入长边 {size}"
               + ("（模型训练时的设置）" if args.size is None and meta.get("size") else ""))

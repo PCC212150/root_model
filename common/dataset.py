@@ -213,18 +213,69 @@ def build_target_masks(rsml_path, other_path, orig_size, target_size, mask_width
     return masks, valid
 
 
+def build_gt_stem_mask(other_path, orig_size):
+    """只画 **stem 通道**、且**在原图分辨率**上的真值掩码；无标注返回 None。
+
+    给「起点锚定」的真值侧用（见 skeleton_stats.anchor_roots_to_stem）：RSML 折线的
+    坐标是原图系，所以锚定必须在同一个坐标系里做，不能拿模型分辨率下画的掩码去比。
+
+    比 build_target_masks 便宜得多 —— 它把根系折线也画一遍，那种 5472x3648 的图
+    单是画折线就要好几百毫秒，而这里只画茎的多边形。
+    """
+    if other_path is None:
+        return None
+    lab = parse_other(other_path, image_size=orig_size)
+    if not lab.stems:
+        return None
+    return gt_mask.draw_polygons_at(
+        [gt_mask.scale_points(p, orig_size, orig_size) for p in lab.stems],
+        orig_size)
+
+
+def _annot_bbox(masks):
+    """**根系 / 茎**的并集包围盒 (x0, y0, x1, y1)（右/下开区间）；全空返回 None。
+
+    **不含 check 通道**：缺 labelme 标注时 check 通道被置成全 True，把它算进来
+    包围盒就等于整图，「把裁块中心放在标注上」的偏置会彻底失效。
+    """
+    core = masks[:, :, CH_ROOT] | masks[:, :, CH_STEM]
+    if not core.any():
+        return None
+    rows = np.flatnonzero(core.any(axis=1))
+    cols = np.flatnonzero(core.any(axis=0))
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
 class RootDataset(Dataset):
     """逐项返回 (img[3,H,W] float32 0~1, gt[3,H,W] float32 0/1, name, chan_valid[3])。
 
     构造时完成解码/画掩码/缩放（较慢），训练时仅做轻量增强。
     chan_valid 标记该图哪些通道有真值（缺 labelme 标注时 stem/check 为 0），
     训练侧据此屏蔽对应通道的损失。
+
+    **两种预处理模式**，由 `crop` 决定：
+
+        crop=0（默认）  整图缩放到长边 max_side 再训练。快、省内存，但 5472x3648 的图
+                        缩到 1024 时原图 10px 宽的根只剩 1.9px —— 细根被抹掉。
+        crop=N>0        **切片训练**：原图**不缩放**，每次随机裁 N×N 的块。
+                        同样 1280 个像素，块里的根就是原图的 10px。代价是原图与
+                        全分辨率掩码都要常驻内存（5472x3648 约 120MB/张）。
+
+    为什么不做「整图原始分辨率训练」：实测（tool/mem_probe）5472 batch1 要 116GB，
+    加了梯度检查点也还有 84GB —— 24G 卡差 4.8 倍，不可能。切片是唯一能拿到
+    「原始分辨率下的根宽」的路径。见 config.CROP_SIZE 的注释。
     """
 
     def __init__(self, data_dir, names=None, max_side=1024, stride=16,
-                 mask_width=5, augment=False, seed=0):
+                 mask_width=5, augment=False, seed=0, crop=0):
         self.augment = augment
         self.data_dir = Path(data_dir)
+        self.crop = int(crop or 0)
+        self.stride = int(stride)
+        if self.crop:
+            if self.crop <= 0 or self.crop % self.stride:
+                raise ValueError(f"crop 必须是 {self.stride} 的正整数倍（U-Net 要下采样 4 次"
+                                 f"），收到 {crop}")
         pairs = discover_pairs(self.data_dir)
         if names is not None:
             wanted = set(names)
@@ -236,22 +287,37 @@ class RootDataset(Dataset):
 
         self.items = []
         n_no_other = 0
+        bytes_full = 0
         for name, img_path, rsml_path in pairs:
             img = image_io.load_rgb(img_path)
             h0, w0 = img.shape[:2]
-            w1, h1 = image_io.target_size(w0, h0, max_side, stride)
             other_path = find_other(self.data_dir, name)
-            masks, valid = build_target_masks(rsml_path, other_path,
-                                              (w0, h0), (w1, h1), mask_width)
+            if self.crop:
+                if self.crop > min(w0, h0):
+                    raise ValueError(f"crop={self.crop} 比 {name} 的短边({min(w0, h0)})还大，"
+                                     f"裁不出块来")
+                # 掩码在**原图分辨率**上画（orig=target），裁块时直接切
+                masks, valid = build_target_masks(rsml_path, other_path,
+                                                  (w0, h0), (w0, h0), mask_width)
+                bytes_full += img.nbytes + masks.nbytes
+                item = {"name": name, "img": img, "masks": masks, "valid": valid,
+                        "fill": _corner_fill(img), "bbox": _annot_bbox(masks)}
+            else:
+                w1, h1 = image_io.target_size(w0, h0, max_side, stride)
+                masks, valid = build_target_masks(rsml_path, other_path,
+                                                  (w0, h0), (w1, h1), mask_width)
+                item = {"name": name,
+                        "img": image_io.resize_rgb(img, w1, h1),   # (h1,w1,3) uint8
+                        "masks": masks,                            # (h1,w1,3) bool
+                        "valid": valid,                            # (3,) float32
+                        "fill": _corner_fill(img), "bbox": None}
             if valid[CH_STEM] == 0 or valid[CH_CHECK] == 0:
                 n_no_other += 1
-            self.items.append({
-                "name": name,
-                "img": image_io.resize_rgb(img, w1, h1),   # (h1,w1,3) uint8
-                "masks": masks,                            # (h1,w1,3) bool
-                "valid": valid,                            # (3,) float32
-                "fill": _corner_fill(img),
-            })
+            self.items.append(item)
+        if self.crop:
+            print(f"[切片训练] 原图不缩放，每轮随机裁 {self.crop}×{self.crop}；"
+                  f"{len(self.items)} 张原图+全分辨率掩码常驻内存 ≈ "
+                  f"{bytes_full / 2**30:.2f} GB")
         if n_no_other:
             print(f"[警告] {n_no_other} 张图缺 stem/check 标注（labels/other 里没有对应 "
                   f"json），训练时这两个通道的损失会被屏蔽。")
@@ -259,10 +325,43 @@ class RootDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def _crop_window(self, it):
+        """返回裁块左上角 (x0, y0)。训练时随机、验证时固定（保证 val 指标跨轮可比）。"""
+        img = it["img"]
+        h, w = img.shape[:2]
+        n = self.crop
+
+        def clamp(v, hi):
+            return int(max(0, min(hi, v)))
+
+        if not self.augment:
+            # 验证集：**确定性**裁在标注包围盒中心。每轮裁的位置一样，val Dice 才能
+            # 跨轮比较；随机裁会让 val 曲线抖到没法用来早停/选模型。
+            bb = it["bbox"]
+            cx, cy = ((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2) if bb else (w / 2, h / 2)
+            return clamp(cx - n / 2, w - n), clamp(cy - n / 2, h - n)
+        if it["bbox"] is None or random.random() < config.CROP_BG_PROB:
+            # 纯随机位置：留这个口子是为了让模型也见到整块背景，
+            # 否则推理时容易在空白水域产生假阳性。
+            return random.randint(0, w - n), random.randint(0, h - n)
+        # 把块中心放在标注包围盒（外扩 n/2）内随机取 —— 保证裁块一定碰到标注，
+        # 不然 5472x3648 上纯随机会有相当比例的块整块落在空白处，白跑一轮。
+        bx0, by0, bx1, by1 = it["bbox"]
+        cx = random.uniform(bx0 - n / 2, bx1 + n / 2)
+        cy = random.uniform(by0 - n / 2, by1 + n / 2)
+        return clamp(cx - n / 2, w - n), clamp(cy - n / 2, h - n)
+
     def __getitem__(self, idx):
         it = self.items[idx]
-        img = it["img"]
-        m = it["masks"]
+        if self.crop:
+            x0, y0 = self._crop_window(it)
+            n = self.crop
+            # numpy 切片是视图，代价接近 0；全分辨率掩码因此可以直接常驻内存
+            img = np.ascontiguousarray(it["img"][y0:y0 + n, x0:x0 + n])
+            m = np.ascontiguousarray(it["masks"][y0:y0 + n, x0:x0 + n])
+        else:
+            img = it["img"]
+            m = it["masks"]
         if self.augment:
             if random.random() < 0.5:
                 img = np.flip(img, axis=1)

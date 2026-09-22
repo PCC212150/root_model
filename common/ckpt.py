@@ -56,8 +56,36 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
         # 训练时的输入长边：推理/测试要按它来，尺度不一致会明显掉精度（实测 1024 训的模型
         # 用 2048 推理，总长误差从 4278px 涨到 9675px）
         "size": hp.get("size"),
+        # 切片训练的块边长；>0 表示这个模型是**在原始分辨率的块上**训的。这时 `size`
+        # 的含义变成「块边长」而不是「推理该用的长边」，两者不能混 —— 见下面
+        # require_explicit_size。
+        "crop": hp.get("crop") or 0,
     }
     return model, meta
+
+
+def require_explicit_size(metas, size_arg, names) -> None:
+    """切片训练的模型必须**显式**给 --size，否则直接报错退出。
+
+    为什么不能给个默认值：切片模型权重里记的 `size` 是**训练时的块边长**（比如 1280），
+    而推理该用的是「整图缩放到的长边」，两者含义不同、数值也不该一样。默认去取 `size`
+    会把 5472 的图缩到 1280 —— 比训练时看到的还小，尺度直接错掉一大截，而结果看上去
+    完全正常（掩码照样出得来）。**这种错只能靠拦住来防，没法靠看结果发现。**
+
+    size_arg 是用户实际传的 --size（没传是 None）。
+    """
+    crops = [m.get("crop") or 0 for m in metas]
+    if size_arg is not None or not any(crops):
+        return
+    c = max(crops)
+    raise SystemExit(
+        f"[错误] {'/'.join(names)} 是**切片训练**的模型（--crop {c}，在原始分辨率上训练），\n"
+        f"        权重里记的 size={metas[0].get('size')} 是**块边长**，不是推理该用的尺度。\n"
+        f"        必须显式给 --size —— 模型是全卷积的，可以在任意尺度推理，\n"
+        f"        但越接近原始分辨率（本数据集长边 5472）越好，上限只受显存限制。\n"
+        f"        24G 卡实测（tool/mem_probe）：--size 5472 约 40GB(超) / 3648 约 18GB /\n"
+        f"        2736 约 10GB / 2048 约 5.7GB。\n"
+        f"        例：... --model {names[0]} --size 3648")
 
 
 def resolve_model_dir(model_arg, root=None) -> Path:
@@ -122,4 +150,8 @@ def load_models(pths, device="cpu", require: int = REQUIRED_CHANNELS):
     if len(sizes) > 1:
         raise SystemExit(f"[错误] 集成要求所有模型用同一个输入长边，当前是 {sizes}。"
                          f"请挑选训练 --size 相同的模型，或分开跑。")
+    crops = sorted({m.get("crop") or 0 for m in metas})
+    if len(crops) > 1:
+        raise SystemExit(f"[错误] 不能把切片训练与整图缩放的模型混在一起集成"
+                         f"（--crop 分别是 {crops}）：两者的尺度语义不同，概率图对不上。")
     return models, metas

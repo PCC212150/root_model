@@ -126,6 +126,13 @@ def channel_weights(base, valid):
 def parse_args():
     p = argparse.ArgumentParser(description="训练甘蔗根系 U-Net（三通道多标签）")
     p.add_argument("--size", type=int, default=config.MAX_SIDE, help="输入长边像素")
+    p.add_argument("--crop", type=int, default=config.CROP_SIZE,
+                   help="**切片训练**的块边长(px，必须是 16 的倍数)。>0 时从原图"
+                        "**不缩放**随机裁 --crop × --crop 训练，让模型看到原始分辨率的"
+                        "根宽（5472x3648 的图缩到 1024 时，原图 10px 的根只剩 1.9px）。"
+                        "此时 --size 只写进权重、不参与预处理。"
+                        "⚠️ 推理时**必须显式给 --size**：模型是全卷积的，越接近原始分辨率"
+                        "越好，24G 上 --size 3648 约 18GB。默认见 config.CROP_SIZE")
     p.add_argument("--batch", type=int, default=config.BATCH_SIZE)
     p.add_argument("--accum", type=int, default=config.ACCUM,
                    help="梯度累积步数：等效 batch = --batch × --accum。显存不够时用它换等效 batch"
@@ -219,9 +226,11 @@ def main():
     print(f"验证植株: {', '.join(val_plants) if val_plants else '无(不早停,保存最后轮)'}")
     t0 = time.time()
     train_ds = RootDataset(args.data_dir, names=train_names,
-                           max_side=args.size, augment=True, seed=args.seed)
+                           max_side=args.size, augment=True, seed=args.seed,
+                           crop=args.crop)
     val_ds = RootDataset(args.data_dir, names=val_names,
-                         max_side=args.size, augment=False, seed=args.seed)
+                         max_side=args.size, augment=False, seed=args.seed,
+                         crop=args.crop)
     assert len(train_ds) == len(train_names), "训练集样本数不符（名字对不上？）"
     assert len(val_ds) == len(val_names), "验证集样本数不符（名字对不上？）"
     print(f"数据加载完成，用时 {time.time() - t0:.1f}s")
@@ -245,9 +254,15 @@ def main():
     model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     eff_batch = args.batch * args.accum
-    print(f"U-Net 参数量: {n_params / 1e6:.2f}M | 输入长边 {args.size} | "
-          f"batch {args.batch}" + (f"×累积{args.accum}={eff_batch}" if args.accum > 1 else "")
+    print(f"U-Net 参数量: {n_params / 1e6:.2f}M | "
+          + (f"切片训练 块 {args.crop}×{args.crop}（原图不缩放）"
+             if args.crop else f"整图缩放到长边 {args.size}")
+          + f" | batch {args.batch}" + (f"×累积{args.accum}={eff_batch}"
+                                       if args.accum > 1 else "")
           + f" | 输出 {N_CH} 通道 {config.CLASS_NAMES}")
+    if args.crop and not args.workers:
+        print("[警告] 切片训练下 num_workers=0 会让主进程同步切图+增强，GPU 空等。"
+              "服务器上务必 --workers 8。")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=config.WEIGHT_DECAY)
     # 按验证指标自动降 LR。不用 CosineAnnealingLR(T_max=args.epochs)：T_max 是「上限轮数」
