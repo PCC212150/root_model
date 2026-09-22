@@ -277,7 +277,9 @@ class RootDataset(Dataset):
         # 而 LR 平台期(25)与早停(120)都是按**轮**计的 —— 一个 epoch 才 4.5 秒的话，
         # LR 几分钟就降到下限、早停十几分钟就触发，等于根本没训。抽 8 个块让一个
         # epoch 的步数与整图模式同量级。见 config.CROP_REPEAT。
-        self.repeat = max(1, int(crop_repeat)) if self.crop else 1
+        # **只在 augment 时重复**：验证集用的是确定性裁块（裁在标注包围盒中心），
+        # 重复抽 8 次拿到的是同一块 —— 白白把验证时间乘以 8，指标一点没变。
+        self.repeat = max(1, int(crop_repeat)) if (self.crop and self.augment) else 1
         if self.crop:
             if self.crop <= 0 or self.crop % self.stride:
                 raise ValueError(f"crop 必须是 {self.stride} 的正整数倍（U-Net 要下采样 4 次"
