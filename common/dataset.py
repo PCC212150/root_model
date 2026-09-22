@@ -267,11 +267,17 @@ class RootDataset(Dataset):
     """
 
     def __init__(self, data_dir, names=None, max_side=1024, stride=16,
-                 mask_width=5, augment=False, seed=0, crop=0):
+                 mask_width=5, augment=False, seed=0, crop=0, crop_repeat=1):
         self.augment = augment
         self.data_dir = Path(data_dir)
         self.crop = int(crop or 0)
         self.stride = int(stride)
+        # 切片模式下每张原图在一个 epoch 里抽多少个块。**这不是可有可无的调优项**：
+        # 不重复的话一个 epoch 只有「图片数」个样本（本项目 23 个，batch2 才 11 步），
+        # 而 LR 平台期(25)与早停(120)都是按**轮**计的 —— 一个 epoch 才 4.5 秒的话，
+        # LR 几分钟就降到下限、早停十几分钟就触发，等于根本没训。抽 8 个块让一个
+        # epoch 的步数与整图模式同量级。见 config.CROP_REPEAT。
+        self.repeat = max(1, int(crop_repeat)) if self.crop else 1
         if self.crop:
             if self.crop <= 0 or self.crop % self.stride:
                 raise ValueError(f"crop 必须是 {self.stride} 的正整数倍（U-Net 要下采样 4 次"
@@ -315,7 +321,8 @@ class RootDataset(Dataset):
                 n_no_other += 1
             self.items.append(item)
         if self.crop:
-            print(f"[切片训练] 原图不缩放，每轮随机裁 {self.crop}×{self.crop}；"
+            print(f"[切片训练] 原图不缩放，每轮随机裁 {self.crop}×{self.crop}，"
+                  f"每图抽 {self.repeat} 块 → 一个 epoch {len(self.items) * self.repeat} 个样本；"
                   f"{len(self.items)} 张原图+全分辨率掩码常驻内存 ≈ "
                   f"{bytes_full / 2**30:.2f} GB")
         if n_no_other:
@@ -323,7 +330,7 @@ class RootDataset(Dataset):
                   f"json），训练时这两个通道的损失会被屏蔽。")
 
     def __len__(self):
-        return len(self.items)
+        return len(self.items) * self.repeat
 
     def _crop_window(self, it):
         """返回裁块左上角 (x0, y0)。训练时随机、验证时固定（保证 val 指标跨轮可比）。"""
@@ -352,7 +359,9 @@ class RootDataset(Dataset):
         return clamp(cx - n / 2, w - n), clamp(cy - n / 2, h - n)
 
     def __getitem__(self, idx):
-        it = self.items[idx]
+        # repeat>1 时同一张原图在一个 epoch 里出现 repeat 次（各抽一个不同的块）。
+        # 用整除而不是取模：保证每张图**恰好**被抽 repeat 次，epoch 的语义不乱。
+        it = self.items[idx // self.repeat]
         if self.crop:
             x0, y0 = self._crop_window(it)
             n = self.crop

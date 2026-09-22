@@ -133,6 +133,10 @@ def parse_args():
                         "此时 --size 只写进权重、不参与预处理。"
                         "⚠️ 推理时**必须显式给 --size**：模型是全卷积的，越接近原始分辨率"
                         "越好，24G 上 --size 3648 约 18GB。默认见 config.CROP_SIZE")
+    p.add_argument("--crop-repeat", type=int, default=config.CROP_REPEAT,
+                   help="切片模式下每张原图在一个 epoch 里抽多少个块（默认见 "
+                        "config.CROP_REPEAT）。**必须 ≥2**：只有一个块时一个 epoch 才 "
+                        "11 步，LR 平台期与早停会按轮很快触发，等于没训")
     p.add_argument("--batch", type=int, default=config.BATCH_SIZE)
     p.add_argument("--accum", type=int, default=config.ACCUM,
                    help="梯度累积步数：等效 batch = --batch × --accum。显存不够时用它换等效 batch"
@@ -227,12 +231,15 @@ def main():
     t0 = time.time()
     train_ds = RootDataset(args.data_dir, names=train_names,
                            max_side=args.size, augment=True, seed=args.seed,
-                           crop=args.crop)
+                           crop=args.crop, crop_repeat=args.crop_repeat)
     val_ds = RootDataset(args.data_dir, names=val_names,
                          max_side=args.size, augment=False, seed=args.seed,
-                         crop=args.crop)
-    assert len(train_ds) == len(train_names), "训练集样本数不符（名字对不上？）"
-    assert len(val_ds) == len(val_names), "验证集样本数不符（名字对不上？）"
+                         crop=args.crop, crop_repeat=args.crop_repeat)
+    # 切片模式下 len(ds) = 图片数 × crop_repeat，所以断言要按图片数比
+    assert len(train_ds) == len(train_names) * train_ds.repeat, \
+        "训练集样本数不符（名字对不上？）"
+    assert len(val_ds) == len(val_names) * val_ds.repeat, \
+        "验证集样本数不符（名字对不上？）"
     print(f"数据加载完成，用时 {time.time() - t0:.1f}s")
 
     loader = torch.utils.data.DataLoader(
