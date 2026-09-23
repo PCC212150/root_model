@@ -123,6 +123,25 @@ def channel_weights(base, valid):
     return w * valid
 
 
+def _accumulate(pb, gt, vd, d_all, i_all):
+    """把**一张图**的逐通道 Dice / IoU 追加进 d_all / i_all；缺标注的通道记 nan。
+
+    切片模型与整图模型两条验证路径共用，保证两种模式的指标口径完全一致。
+    pb / gt 是 (C, h, w) 的 bool，vd 是 (C,)。在**原图分辨率**上算。
+    """
+    ds, is_ = [], []
+    for c in range(N_CH):
+        if vd[c] < 0.5:
+            ds.append(np.nan)
+            is_.append(np.nan)
+            continue
+        tp = float((pb[c] & gt[c]).sum())
+        ds.append(2.0 * tp / (pb[c].sum() + gt[c].sum() + 1e-8))
+        is_.append(tp / (pb[c].sum() + gt[c].sum() - tp + 1e-8))
+    d_all.append(ds)
+    i_all.append(is_)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="训练甘蔗根系 U-Net（三通道多标签）")
     p.add_argument("--size", type=int, default=config.MAX_SIDE, help="输入长边像素")
@@ -232,9 +251,15 @@ def main():
     train_ds = RootDataset(args.data_dir, names=train_names,
                            max_side=args.size, augment=True, seed=args.seed,
                            crop=args.crop, crop_repeat=args.crop_repeat)
+    # 验证集的预处理必须与**部署形式**一致：
+    #   切片模型  -> full=True：整图、原始分辨率、不缩放，验证时逐块滑窗前向（见下面的验证段）
+    #   非切片模型 -> 缩放到 --size、整图一次前向（老路径，不变）
+    # 曾经给切片模型用的是「单个中心裁块」，那是个**退化**的验证：块里的 check GT 几乎
+    # 全是 True，预测全 True 就能拿 Dice 0.99（实测日志里从第 21 轮起恒为 0.99），
+    # 于是 select_dice / 早停 / LR 调度全在一个假信号上跑 —— 整轮实验都是盲的。
     val_ds = RootDataset(args.data_dir, names=val_names,
                          max_side=args.size, augment=False, seed=args.seed,
-                         crop=args.crop, crop_repeat=args.crop_repeat)
+                         crop=0, crop_repeat=1, full=bool(args.crop))
     # 切片模式下 len(ds) = 图片数 × crop_repeat，所以断言要按图片数比
     assert len(train_ds) == len(train_names) * train_ds.repeat, \
         "训练集样本数不符（名字对不上？）"
@@ -246,9 +271,13 @@ def main():
         train_ds, batch_size=args.batch, shuffle=True, drop_last=True,
         num_workers=args.workers, pin_memory=True,
         persistent_workers=args.workers > 0)
-    val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=args.batch, shuffle=False, num_workers=args.workers,
-        persistent_workers=args.workers > 0)
+    # 切片模型的验证是「逐张整图滑窗」，用不上 DataLoader；而且硬建一个会让每个
+    # worker 都持有一份整图（Windows 的 spawn 是真拷贝，几百 MB × workers）。
+    val_loader = None
+    if not args.crop:
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=args.batch, shuffle=False, num_workers=args.workers,
+            persistent_workers=args.workers > 0)
     if args.workers == 0 and device.type == "cuda":
         print("[提示] num_workers=0：读图与数据增强在主进程里同步做，GPU 会空等。"
               "服务器上可加 --workers 8（本机 Windows 保持 0 即可）。")
@@ -402,28 +431,30 @@ def main():
             if val_ds:
                 model.eval()
                 d_all, i_all = [], []
-                with torch.no_grad():
-                    for x, y, _, valid in val_loader:
-                        x = x.to(device)
-                        with torch.autocast(device_type="cuda", enabled=amp):
-                            prob = torch.sigmoid(model(x)).float()
-                        pb = prob.cpu().numpy() > 0.5
-                        gt = y.numpy() > 0.5
-                        vd = valid.numpy()
-                        for i in range(len(gt)):
-                            ds, is_ = [], []
-                            for c in range(N_CH):
-                                if vd[i, c] < 0.5:      # 该图缺这个通道的标注
-                                    ds.append(np.nan)
-                                    is_.append(np.nan)
-                                    continue
-                                tp = (pb[i, c] & gt[i, c]).sum()
-                                d = 2.0 * tp / (pb[i, c].sum() + gt[i, c].sum() + 1e-8)
-                                iou = tp / (pb[i, c].sum() + gt[i, c].sum() - tp + 1e-8)
-                                ds.append(float(d))
-                                is_.append(float(iou))
-                            d_all.append(ds)
-                            i_all.append(is_)
+                if args.crop:
+                    # 切片模型：**按部署形式验证** —— 原图分块滑窗、概率层拼接、
+                    # 再与整图真值比。与「单个裁块」相比，这里的 check 通道能真正被量到
+                    # （裁块的 GT 几乎全 True，预测全 True 就 0.99，是退化的）。
+                    from common import predict as _predict
+                    with torch.no_grad():
+                        for x, y, _, valid in val_ds:   # 逐张：整图 5472x3648 没法 batching
+                            img = (x.permute(1, 2, 0).numpy() * 255.0).round() \
+                                .astype(np.uint8)
+                            prob = _predict.tiled_probs(model, img, args.crop,
+                                                        device=device)
+                            _accumulate(prob.numpy()[0] > 0.5, y.numpy() > 0.5,
+                                        valid.numpy(), d_all, i_all)
+                else:
+                    with torch.no_grad():
+                        for x, y, _, valid in val_loader:
+                            x = x.to(device)
+                            with torch.autocast(device_type="cuda", enabled=amp):
+                                prob = torch.sigmoid(model(x)).float()
+                            pb = prob.cpu().numpy() > 0.5
+                            gt = y.numpy() > 0.5
+                            vd = valid.numpy()
+                            for i in range(len(gt)):
+                                _accumulate(pb[i], gt[i], vd[i], d_all, i_all)
                 if d_all:
                     with np.errstate(invalid="ignore"):
                         per_ch_dice = list(np.nanmean(np.asarray(d_all), axis=0))

@@ -159,22 +159,21 @@ def make_overlay(img: np.ndarray, masks, check_box, alpha: float = 0.45) -> np.n
     return out
 
 
-def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask, gpu_lock):
+def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
+                gpu_lock, tile=0):
     """处理一张图：预测 → 统计 → 写 overlay/RSML；返回 (CSV 行, 控制台文本)。
 
     **并发安全**：只有 GPU 那一小段用 gpu_lock 串行 —— 单张图的 GPU 活本来就少
     （模型前向实测 0.33s），串行不拖慢整体，却避免多线程同时抢显存；
     其余全是 numpy / PIL / skimage，各线程各管各的。
+
+    tile>0 时走**原始分辨率滑窗**（切片模型专用，见 ckpt.infer_tile）；滑窗的前向
+    同样在锁里，整张图的所有块串行跑完再放锁。
     """
     img = image_io.load_rgb(p)
     with gpu_lock:
         res = predict.predict(model, img, max_side=size, stride=config.STRIDE,
-                              device=device, low_thresh=config.PRED_LOW_THRESHOLD)
-    masks = res["masks"]
-    img = image_io.load_rgb(p)
-    res = predict.predict(model, img, max_side=size,
-                          stride=config.STRIDE, device=device,
-                          low_thresh=config.PRED_LOW_THRESHOLD)
+                              device=device, tile=tile)
     masks = res["masks"]
     # 起点锚定到茎：补回被泡沫环挡住的那一段（计入根长，与标注同口径）
     st = analyze_mask_anchored(
@@ -253,19 +252,23 @@ def main():
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
-    # 切片训练的模型必须显式给 --size（权重里记的 size 是块边长，不是推理尺度）
-    ckpt.require_explicit_size(metas, size_arg, names)
     meta = metas[0]
+    # 切片训练的模型走**原始分辨率滑窗**（见 ckpt.infer_tile 的实测对比）；0 = 老路径
+    tile = ckpt.infer_tile(metas, size_arg)
     tag = f"集成 {len(names)} 个" if len(names) > 1 else "模型"
     print(f"{tag}: {' + '.join(names)} | 设备: {device} | 输出 {meta['out_ch']} 通道"
           + (f" (epoch {meta['epoch']})" if meta.get("epoch") else ""))
-    # 输入尺寸必须与训练时一致（实测：1024 训的模型用 2048 推理，总长误差从 4278px 涨到 9675px）
-    size = size_arg or meta.get("size") or config.MAX_SIDE
-    if size_arg is None and meta.get("size"):
-        print(f"输入长边 {size}（用模型训练时的设置）")
-    elif meta.get("size") and size_arg != meta.get("size"):
-        print(f"[警告] 输入长边 {size_arg} 与模型训练时（{meta['size']}）不一致："
-              f"尺度不匹配会明显掉精度，建议按训练尺度跑")
+    if tile:
+        size = tile
+        print(f"[切片模型] **原始分辨率滑窗**推理，块边长 {tile}（整图不缩放）")
+    else:
+        # 输入尺寸必须与训练时一致（实测：1024 训的模型用 2048 推理，总长误差从 4278px 涨到 9675px）
+        size = size_arg or meta.get("size") or config.MAX_SIDE
+        if size_arg is None and meta.get("size"):
+            print(f"输入长边 {size}（用模型训练时的设置）")
+        elif meta.get("size") and size_arg != meta.get("size"):
+            print(f"[警告] 输入长边 {size_arg} 与模型训练时（{meta['size']}）不一致："
+                  f"尺度不匹配会明显掉精度，建议按训练尺度跑")
 
     imgs = sorted(p for p in img_dir.iterdir()
                   if p.suffix.lower() in config.IMAGE_EXTS)
@@ -305,7 +308,7 @@ def main():
 
     def work(i):
         return process_one(imgs[i], model, size, device, out_dir, mm,
-                           overlay_fmt, save_mask, gpu_lock)
+                           overlay_fmt, save_mask, gpu_lock, tile=tile)
 
     if jobs == 1:
         for k in range(len(imgs)):

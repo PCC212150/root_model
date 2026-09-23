@@ -168,9 +168,9 @@ def main():
     size = args.size or config.MAX_SIDE
     if not args.gt_mask:
         model, folder, meta = load_model(args.model, device)
-        # 切片训练的模型必须显式给 --size（权重里记的 size 是块边长，不是推理尺度）
-        ckpt.require_explicit_size([meta], args.size, [folder.name])
-        size = args.size or meta.get("size") or config.MAX_SIDE
+        # 切片训练的模型走原始分辨率滑窗（见 ckpt.infer_tile）；0 = 走整图缩放的老路径
+        tile = ckpt.infer_tile([meta], args.size)
+        size = tile or args.size or meta.get("size") or config.MAX_SIDE
         print(f"模型: {folder.name} | 设备: {device} | 输入长边 {size}"
               + ("（模型训练时的设置）" if args.size is None and meta.get("size") else ""))
         if meta.get("size") and args.size and args.size != meta["size"]:
@@ -196,7 +196,7 @@ def main():
             prob = None
         else:
             res = predict.predict(model, img, max_side=size, stride=config.STRIDE,
-                                  device=device, low_thresh=0)
+                                  device=device, low_thresh=0, tile=tile)
             # 概率图整张只前向一次，多组 low 阈值复用。prob_target 已在概率层清掉
             # 检查范围之外（与部署同口径），阈值化后再与 ROI 精确求交即可完全对齐。
             prob = torch.from_numpy(res["prob_target"]).unsqueeze(0).unsqueeze(0)

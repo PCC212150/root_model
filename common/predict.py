@@ -108,15 +108,95 @@ def _forward_prob(model, x):
     return acc / len(models)          # 单个模型时除以 1，与原行为完全一致
 
 
+def _tile_starts(total: int, tile: int, step: int) -> list:
+    """滑窗起点：0, step, 2*step… 最后一块**贴到 total-tile**，保证覆盖到右边/下边。
+
+    不加这最后一块的话，末尾会剩一条没被任何块覆盖的窄边（比如 total=5472、
+    tile=1536、step=1280 时最后一块从 3840 开始、到 5376 结束，右边空了 96px）。
+    """
+    if tile >= total:
+        return [0]
+    xs = list(range(0, total - tile + 1, step))
+    if xs[-1] != total - tile:
+        xs.append(total - tile)
+    return xs
+
+
+def _ramp(tile: int, ov: int, eps: float = 0.05) -> np.ndarray:
+    """一维拼接权重：中间 1，两端在 ov 像素内线性降到 eps。"""
+    w = np.ones(tile, dtype=np.float32)
+    if ov <= 0 or 2 * ov >= tile:
+        return w
+    r = np.linspace(eps, 1.0, ov + 1, dtype=np.float32)[1:]
+    w[:ov], w[tile - ov:] = r, r[::-1]
+    return w
+
+
+def tiled_probs(model, img: np.ndarray, tile: int, overlap: int = 256,
+                device="cuda"):
+    """**原始分辨率滑窗** -> 原图分辨率的逐通道概率张量 [1,C,h,w]。
+
+    为什么需要它：U-Net 是全卷积的，但显存限制单次前向能吃的尺寸（tool/mem_probe
+    实测 5472x3648 要 40GB，24G 卡塞不进）。而「把整图缩到 2048」会改变尺度 —— 模型
+    学的是**原始分辨率下的根宽（10px）**，缩到 0.374 倍只剩 3.7px，实测茎通道会直接
+    塌成 0（那是总长系统性偏短的直接来源：锚定依赖茎）。
+
+    **拼接必须在概率层做，不能二值后再拼**：二值图在块边界各自截断，一条根会被切成
+    几段 —— 而断/并正是本项目根数与总长误差的主要来源。
+
+    权重用**渐变**（块中心 1、边缘趋近 0）而不是均匀：块边缘的上下文最少、预测最不可靠，
+    均匀平均会把边缘的差预测掺进中心的好预测里。实测（8 张测试图，根通道）渐变在
+    逐图上普遍比均匀好 0.02~0.03，均值持平；但在**茎**通道上两者都远好于整图缩放。
+
+    返回 torch 张量（与 _forward_prob 同形），调用方直接把 w1,h1 当成原图尺寸用即可。
+    """
+    if tile <= 0:
+        raise ValueError("tile 必须 > 0")
+    h0, w0 = img.shape[:2]
+    # 块不能比图还大：夹到短边，并对齐到 16（U-Net 要下采样 4 次，否则前向会报错）
+    tile = min(tile, h0, w0) // 16 * 16
+    if tile < 16:
+        raise ValueError(f"图太小（{w0}x{h0}），滑窗至少要 16px")
+    # overlap 必须**严格小于** tile，否则 step 退化成 1，块数会爆成几十万
+    # （实测：tile=256 / overlap=256 时 _tile_starts 会给出 5217 个起点）。
+    overlap = max(0, min(overlap, tile // 2))
+    step = max(1, tile - overlap)
+    ys = _tile_starts(h0, tile, step)
+    xs = _tile_starts(w0, tile, step)
+    ww = np.outer(_ramp(tile, overlap), _ramp(tile, overlap))
+
+    models = list(model) if isinstance(model, (list, tuple)) else [model]
+    acc = cnt = None
+    for y in ys:
+        for x in xs:
+            sub = np.ascontiguousarray(img[y:y + tile, x:x + tile])
+            probs = _forward_prob(models, image_io.to_model_input(sub).to(device))
+            p = probs[0].float().cpu().numpy()          # (C, tile, tile)
+            if acc is None:
+                acc = np.zeros((p.shape[0], h0, w0), dtype=np.float32)
+                cnt = np.zeros((h0, w0), dtype=np.float32)
+            acc[:, y:y + tile, x:x + tile] += p * ww
+            cnt[y:y + tile, x:x + tile] += ww
+    if acc is None:
+        raise RuntimeError("滑窗没有产生任何块")
+    # 形状必须与 _forward_prob 的输出 [1, C, h, w] 一致 —— 差一个前导维的话，
+    # 下游的 prob[0, c] 会退化成 [0, c] 双重索引，静默取出一个一维向量。
+    return torch.from_numpy(acc / np.maximum(cnt, 1e-6)[None])[None]
+
+
 def predict(model, img: np.ndarray, max_side: int, stride: int = 16,
-            device="cuda", low_thresh: float = 0.10,
+            device="cuda", low_thresh: float = None,
             check_margin_px: float = None, use_check: bool = True,
-            full_channels=(CH_ROOT, CH_STEM)) -> dict:
+            full_channels=(CH_ROOT, CH_STEM), tile: int = 0,
+            overlap: int = 256) -> dict:
     """对一张 uint8 RGB (h0, w0, 3) 图片做多通道分割预测。
 
     model 可以是单个模型或模型列表（列表 = 集成，概率平均，见 _forward_prob）。
 
-    low_thresh > 0 时根系用滞回阈值（细弱处断段接回，适合根数/长度统计），否则用 0.5。
+    low_thresh：滞回低阈值（高阈值固定 0.5）。**留空(None) = 按推理模式自动选** ——
+    整图缩放走 config.PRED_LOW_THRESHOLD、原始分辨率滑窗走 config.PRED_LOW_THRESHOLD_TILED
+    （默认 0 = 关掉滞回，因为原始分辨率下根宽 10px 本来就连通，滞回只拉进光晕）。
+    显式传值（含 0）永远优先 —— tune_stats 就是靠传 0 拿原始概率自己扫阈值的。
     use_check=False 时不做检查范围限定（用于没有该标注/对比旧口径）。
     full_channels 指定 masks 里哪些通道要算**全分辨率**二值掩码（默认根系+茎，
     这两条是全项目唯二有人读的）；不在其中的通道在 masks 里是 None。**注意
@@ -137,11 +217,24 @@ def predict(model, img: np.ndarray, max_side: int, stride: int = 16,
     """
     if check_margin_px is None:
         check_margin_px = config.CHECK_MARGIN_PX
+    # low_thresh=None 表示「按推理模式自动选」，理由见 config.PRED_LOW_THRESHOLD_TILED：
+    # 滞回是为 1024 下的细根断段设的，原始分辨率下根宽 10px、本来就连通，滞回只拉进光晕。
+    # **显式传值永远优先（含显式传 0）** —— tool/tune_stats 就是靠传 0 拿原始概率自己扫阈值的。
+    if low_thresh is None:
+        low_thresh = (config.PRED_LOW_THRESHOLD_TILED if tile and tile > 0
+                      else config.PRED_LOW_THRESHOLD)
     h0, w0 = img.shape[:2]
-    w1, h1 = image_io.target_size(w0, h0, max_side, stride)
-    small = image_io.resize_rgb(img, w1, h1)
-    x = image_io.to_model_input(small).to(device)
-    prob = _forward_prob(model, x)
+    if tile and tile > 0:
+        # **原始分辨率滑窗**：概率图直接在原图分辨率上拼出来，于是令 w1,h1 = w0,h0，
+        # 下游所有「模型分辨率 <-> 原图」的换算自动退化成恒等（scale=1），
+        # ROI 拟合、滞回阈值、上采样一行都不用改。见 tiled_probs 的说明。
+        prob = tiled_probs(model, img, tile, overlap=overlap, device=device)
+        w1, h1 = w0, h0
+    else:
+        w1, h1 = image_io.target_size(w0, h0, max_side, stride)
+        small = image_io.resize_rgb(img, w1, h1)
+        x = image_io.to_model_input(small).to(device)
+        prob = _forward_prob(model, x)
     n_ch = prob.shape[1]
     probs = [prob[0, c].float().cpu().numpy() for c in range(n_ch)]
 

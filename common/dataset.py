@@ -267,10 +267,16 @@ class RootDataset(Dataset):
     """
 
     def __init__(self, data_dir, names=None, max_side=1024, stride=16,
-                 mask_width=5, augment=False, seed=0, crop=0, crop_repeat=1):
+                 mask_width=5, augment=False, seed=0, crop=0, crop_repeat=1,
+                 full=False):
         self.augment = augment
         self.data_dir = Path(data_dir)
         self.crop = int(crop or 0)
+        # full=True：**整图、原始分辨率、不缩放也不裁**。给「验证切片模型」用 ——
+        # 切片模型的部署形式是「原图分块跑再拼」，验证必须在同一形式下做，
+        # 否则量到的是另一个分布（实测拿单个中心裁块验证时，check 通道的 GT 几乎全 True，
+        # 预测全 True 就能拿 Dice 0.99，而整图上只有 0.79 —— 指标完全失效）。
+        self.full = bool(full)
         self.stride = int(stride)
         # 切片模式下每张原图在一个 epoch 里抽多少个块。**这不是可有可无的调优项**：
         # 不重复的话一个 epoch 只有「图片数」个样本（本项目 23 个，batch2 才 11 步），
@@ -300,16 +306,17 @@ class RootDataset(Dataset):
             img = image_io.load_rgb(img_path)
             h0, w0 = img.shape[:2]
             other_path = find_other(self.data_dir, name)
-            if self.crop:
-                if self.crop > min(w0, h0):
+            if self.crop or self.full:
+                if self.crop and self.crop > min(w0, h0):
                     raise ValueError(f"crop={self.crop} 比 {name} 的短边({min(w0, h0)})还大，"
                                      f"裁不出块来")
-                # 掩码在**原图分辨率**上画（orig=target），裁块时直接切
+                # 掩码在**原图分辨率**上画（orig=target），裁块/整图时坐标天然对齐
                 masks, valid = build_target_masks(rsml_path, other_path,
                                                   (w0, h0), (w0, h0), mask_width)
                 bytes_full += img.nbytes + masks.nbytes
                 item = {"name": name, "img": img, "masks": masks, "valid": valid,
-                        "fill": _corner_fill(img), "bbox": _annot_bbox(masks)}
+                        "fill": _corner_fill(img),
+                        "bbox": _annot_bbox(masks) if self.crop else None}
             else:
                 w1, h1 = image_io.target_size(w0, h0, max_side, stride)
                 masks, valid = build_target_masks(rsml_path, other_path,
@@ -326,6 +333,9 @@ class RootDataset(Dataset):
             print(f"[切片训练] 原图不缩放，每轮随机裁 {self.crop}×{self.crop}，"
                   f"每图抽 {self.repeat} 块 → 一个 epoch {len(self.items) * self.repeat} 个样本；"
                   f"{len(self.items)} 张原图+全分辨率掩码常驻内存 ≈ "
+                  f"{bytes_full / 2**30:.2f} GB")
+        elif self.full:
+            print(f"[整图验证] 原图不缩放、不裁块，{len(self.items)} 张常驻内存 ≈ "
                   f"{bytes_full / 2**30:.2f} GB")
         if n_no_other:
             print(f"[警告] {n_no_other} 张图缺 stem/check 标注（labels/other 里没有对应 "

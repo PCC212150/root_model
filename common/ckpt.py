@@ -64,28 +64,28 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
     return model, meta
 
 
-def require_explicit_size(metas, size_arg, names) -> None:
-    """切片训练的模型必须**显式**给 --size，否则直接报错退出。
+def infer_tile(metas, size_arg=None) -> int:
+    """推理时的**滑窗块边长**；返回 0 = 走「整图缩放」的老路径。
 
-    为什么不能给个默认值：切片模型权重里记的 `size` 是**训练时的块边长**（比如 1280），
-    而推理该用的是「整图缩放到的长边」，两者含义不同、数值也不该一样。默认去取 `size`
-    会把 5472 的图缩到 1280 —— 比训练时看到的还小，尺度直接错掉一大截，而结果看上去
-    完全正常（掩码照样出得来）。**这种错只能靠拦住来防，没法靠看结果发现。**
+    切片训练的模型**必须在原始分辨率上滑窗推理**，不能把整图缩到 --size 再跑。
+    实测（2026-09-23，model_202609230759，8 张测试图）两种做法的差别是决定性的：
 
-    size_arg 是用户实际传的 --size（没传是 None）。
+        通道      整图缩到 2048     原始分辨率滑窗
+        root      Dice 0.402        Dice 0.401     （平手，但预测面积从超检 2.5 倍回到接近真值）
+        stem      两张图**整块塌成 0**  0.763 / 0.775
+        check     超检到 92~99%      超检减轻
+
+    茎塌掉的后果不只是那一个通道难看 —— **起点锚定依赖茎**，茎没了锚定就是 0 条
+    （用户实测日志里 `起点已锚定到茎 0/59 条`），总长随之系统性偏短。
+
+    块边长默认取训练时的 crop（尺度天然对齐）。传了 --size 就用它 —— 对切片模型来说
+    `--size` 的含义就是块边长（与训练时 `--crop` 同义），调大只增加上下文，尺度不变。
+    **不设上限校验**：块比图大时 common/predict.tiled_probs 会自动夹到短边。
     """
     crops = [m.get("crop") or 0 for m in metas]
-    if size_arg is not None or not any(crops):
-        return
-    c = max(crops)
-    raise SystemExit(
-        f"[错误] {'/'.join(names)} 是**切片训练**的模型（--crop {c}，在原始分辨率上训练），\n"
-        f"        权重里记的 size={metas[0].get('size')} 是**块边长**，不是推理该用的尺度。\n"
-        f"        必须显式给 --size —— 模型是全卷积的，可以在任意尺度推理，\n"
-        f"        但越接近原始分辨率（本数据集长边 5472）越好，上限只受显存限制。\n"
-        f"        24G 卡实测（tool/mem_probe）：--size 5472 约 40GB(超) / 3648 约 18GB /\n"
-        f"        2736 约 10GB / 2048 约 5.7GB。\n"
-        f"        例：... --model {names[0]} --size 3648")
+    if not any(crops):
+        return 0
+    return int(size_arg) if size_arg else max(crops)
 
 
 def resolve_model_dir(model_arg, root=None) -> Path:

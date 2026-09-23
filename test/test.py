@@ -71,18 +71,23 @@ def main():
     if len(names) > 1:
         print(f"集成 {len(names)} 个: {' + '.join(names)}")
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
-    # 切片训练的模型必须显式给 --size（权重里记的 size 是块边长，不是推理尺度）
-    ckpt.require_explicit_size(metas, args.size, names)
     meta = metas[0]
+    # 切片训练的模型走**原始分辨率滑窗**（见 ckpt.infer_tile 的实测对比）；0 = 老路径
+    tile = ckpt.infer_tile(metas, args.size)
     print(f"权重: {pth.name} (保存于 epoch {meta.get('epoch', '?')}"
           + (f"，训练验证Dice {meta['val_dice']:.4f}" if meta.get("val_dice") else "")
           + f"，输出 {meta['out_ch']} 通道)")
-    size = args.size or meta.get("size") or config.MAX_SIDE
-    if args.size is None and meta.get("size"):
-        print(f"输入长边 {size}（用模型训练时的设置）")
-    elif meta.get("size") and args.size != meta.get("size"):
-        print(f"[警告] 输入长边 {args.size} 与模型训练时（{meta['size']}）不一致："
-              f"尺度不匹配会明显掉精度，建议按训练尺度跑")
+    if tile:
+        size = tile
+        print(f"[切片模型] **原始分辨率滑窗**推理，块边长 {tile}（整图不缩放）"
+              f"；像素指标也在原图分辨率上算")
+    else:
+        size = args.size or meta.get("size") or config.MAX_SIDE
+        if args.size is None and meta.get("size"):
+            print(f"输入长边 {size}（用模型训练时的设置）")
+        elif meta.get("size") and args.size != meta.get("size"):
+            print(f"[警告] 输入长边 {args.size} 与模型训练时（{meta['size']}）不一致："
+                  f"尺度不匹配会明显掉精度，建议按训练尺度跑")
 
     pairs = discover_pairs(args.data_dir)
     if not pairs:
@@ -109,7 +114,10 @@ def main():
         n_cont = sum(continuation_flags(roots, max_gap=config.GT_CONT_MAX_GAP,
                                         max_angle=config.GT_CONT_MAX_ANGLE))
         other_path = find_other(args.data_dir, name)
-        w1, h1 = image_io.target_size(w0, h0, size, config.STRIDE)
+        # 滑窗模式下概率图本来就在原图分辨率上拼出来的，像素指标也就在原图分辨率上算
+        # （否则上采样/下采样会再引入一次插值误差）
+        w1, h1 = (w0, h0) if tile else image_io.target_size(w0, h0, size,
+                                                            config.STRIDE)
         # GT 掩码与训练侧同一实现（三类通道），保证口径一致
         gt_masks, valid = build_target_masks(rsml_path, other_path,
                                             (w0, h0), (w1, h1),
@@ -139,8 +147,7 @@ def main():
             gt[CH_ROOT] = gt[CH_ROOT] & gt[CH_CHECK]
 
         res = predict.predict(model, img, max_side=size,
-                              stride=config.STRIDE, device=device,
-                              low_thresh=config.PRED_LOW_THRESHOLD)
+                              stride=config.STRIDE, device=device, tile=tile)
         # 像素指标在**模型分辨率**上算，与训练时的验证 Dice 同一口径
         # （原图分辨率下 GT 是 5px 线、预测被上采样得较细，指标会被线宽差吃掉）
         preds = [res["probs"][c] > 0.5 for c in range(len(res["probs"]))]
