@@ -30,6 +30,10 @@ from common.rsml_parse import parse_rsml, root_stats  # noqa: E402
 from common.skeleton_stats import (analyze_mask_anchored,  # noqa: E402
                                    continuation_flags)
 
+# 要算 clDice / 连通块数的通道：**只给细结构**。检查范围是块状区域、骨架没有意义，
+# 而且骨架化在 5472x3648 上要 0.3s/张，白花。
+CLDICE_CH = (CH_ROOT, CH_STEM)
+
 
 def preprocess_argv():
     """把 --model_xxx 兼容为 --model model_xxx。"""
@@ -99,7 +103,8 @@ def main():
     rows = []
     agg = {k: [] for k in ("gt_roots", "pred_roots", "gt_total", "gt_total_raw",
                            "pred_total", "gt_cont")}
-    per_ch_metrics = {n: {"iou": [], "dice": [], "accuracy": []} for n in names}
+    per_ch_metrics = {n: {"iou": [], "dice": [], "accuracy": [], "cldice": [],
+                          "ncomp": []} for n in names}
     t_start = time.time()
     for name, img_path, rsml_path in pairs:
         img = image_io.load_rgb(img_path)
@@ -159,9 +164,12 @@ def main():
             max_px=config.STEM_ANCHOR_MAX_PX)
         pred_cnt, pred_lens, pred_total = st["count"], st["lengths"], st["total"]
 
-        ms = metrics.multi_channel_metrics(preds, gt, names=names, valid=valid)
+        # clDice / 连通块数只算**细结构**通道：检查范围是块状区域，骨架没有意义，
+        # 而且骨架化在 5472x3648 上要 0.3s/张，白花。
+        ms = metrics.multi_channel_metrics(preds, gt, names=names, valid=valid,
+                                           cldice_channels=CLDICE_CH)
         for m in ms:
-            for k in ("iou", "dice", "accuracy"):
+            for k in ("iou", "dice", "accuracy", "cldice", "ncomp"):
                 per_ch_metrics[m["name"]][k].append(m[k])
         agg["gt_roots"].append(gt_count); agg["pred_roots"].append(pred_cnt)
         agg["gt_total"].append(gt_total)
@@ -169,20 +177,31 @@ def main():
         agg["gt_cont"].append(n_cont); agg["pred_total"].append(pred_total)
         len_str = ";".join(f"{v:.1f}" for v in pred_lens[:30]) or "-"
 
+        def _f(v, fmt="{:.4f}"):
+            return fmt.format(v) if not np.isnan(v) else "-"
+
         row = [name]
         for m in ms:
-            row += [f"{m['iou']:.4f}" if not np.isnan(m["iou"]) else "-",
-                    f"{m['dice']:.4f}" if not np.isnan(m["dice"]) else "-",
-                    f"{m['accuracy']:.4f}" if not np.isnan(m["accuracy"]) else "-"]
+            row += [_f(m["iou"]), _f(m["dice"]), _f(m["accuracy"]),
+                    _f(m["cldice"]), _f(m["ncomp"], "{:.0f}")]
         row += [gt_count, n_cont, pred_cnt, st["anchored_count"], gt_anchored,
                 f"{gt_total_raw:.1f}", f"{gt_total:.1f}", f"{pred_total:.1f}", len_str]
         if mm and mm > 0:
             row += [f"{gt_total * mm:.1f}", f"{pred_total * mm:.1f}"]
         rows.append(row)
 
-        desc = " | ".join(
-            f"{m['name']} IoU={m['iou']:.4f} Dice={m['dice']:.4f}"
-            if not np.isnan(m["iou"]) else f"{m['name']} 无真值" for m in ms)
+        parts = []
+        for m in ms:
+            if np.isnan(m["iou"]):
+                parts.append(f"{m['name']} 无真值")
+                continue
+            s = f"{m['name']} Dice={m['dice']:.4f}"
+            if not np.isnan(m["cldice"]):
+                # clDice 与连通块数必须和 Dice 并排看 —— 只看 Dice 会得出与肉眼
+                # 相反的结论（实测 erode=3 让 MAE 变好但连通块 103 -> 156）。
+                s += f" clDice={m['cldice']:.3f} 块={m['ncomp']:.0f}"
+            parts.append(s)
+        desc = " | ".join(parts)
         print(f"[{name}] {desc} | 根数 GT {gt_count}(含续接 {n_cont})/预测 {pred_cnt}"
               f" | 锚定 GT {gt_anchored} 条 / 预测 {st['anchored_count']} 条 | "
               f"总长 GT {gt_total_raw:.0f}→理想 {gt_total:.0f} | 预测 {pred_total:.0f}")
@@ -197,7 +216,8 @@ def main():
 
     header = ["图片名"]
     for n in names:
-        header += [f"IoU({n})", f"Dice({n})", f"像素准确率({n})"]
+        header += [f"IoU({n})", f"Dice({n})", f"像素准确率({n})",
+                   f"clDice({n})", f"连通块({n})"]
     header += ["GT根数(ID数)", "其中续接片段", "预测根数", "预测锚定(条)", "GT锚定(条)",
                "GT总长-标注(px)", "GT总长-理想(px)", "预测总长(px)",
                "预测各根长(px,降序,至多30条)"]
@@ -223,8 +243,15 @@ def main():
         dice = metrics.nanmean(per_ch_metrics[n]["dice"])
         iou = metrics.nanmean(per_ch_metrics[n]["iou"])
         acc = metrics.nanmean(per_ch_metrics[n]["accuracy"])
-        summary.append(f"# {n}: Dice {dice:.4f} | IoU {iou:.4f} | 像素准确率 {acc:.4f}"
-                       if not np.isnan(dice) else f"# {n}: 测试集无该通道真值")
+        if np.isnan(dice):
+            summary.append(f"# {n}: 测试集无该通道真值")
+            continue
+        line = f"# {n}: Dice {dice:.4f} | IoU {iou:.4f} | 像素准确率 {acc:.4f}"
+        cd = metrics.nanmean(per_ch_metrics[n]["cldice"])
+        ncp = metrics.nanmean(per_ch_metrics[n]["ncomp"])
+        if not np.isnan(cd):
+            line += f" | **clDice {cd:.4f}** | **连通块 {ncp:.1f}**"
+        summary.append(line)
 
     # ---- 根数只在「标注没有续接片段」的图上才可信 ----
     # root_stats 数的是 RSML 里 <root> 元素的个数 = 折线条数 = ID 数。而标注在交叉处
@@ -240,6 +267,14 @@ def main():
             f"#   其余 {len(pairs) - len(clean)} 张的 ID 数被交叉处的断开重画撑大了，"
             f"根数误差不可比（详见 tool/chain_diag/readme.md）",
         ]
+    summary += [
+        "# clDice / 连通块：clDice 量**骨架的连通性**（断一段就掉），连通块数是预测",
+        "# 根掩码碎成了多少块。**这两个必须和 Dice 并排看** —— 像素 Dice/IoU 对「一条根",
+        "# 断成几截」几乎不敏感（实测两个模型 Dice 只差 0.01，连通块数却差 3~5 倍）。",
+        "# 只看 Dice 或只看总长 MAE 去调后处理，会得出与肉眼**相反**的结论：实测 erode=3",
+        "# 让总长 MAE 从 2940 降到 2590，但连通块从 103 涨到 156（真值只有 4 块）。",
+        "# 只对细结构通道（根系 / 茎）算 —— 检查范围是块状区域，骨架没有意义。",
+    ]
     summary += [
         f"# 统计口径：输入长边 {size}；根系只在模型识别出的检查范围内统计，"
         f"且真值与预测**都走同一条流水线**（掩码→骨架→分链→起点锚定）；"
@@ -267,12 +302,17 @@ def main():
     print()
     for n in names:
         dice = metrics.nanmean(per_ch_metrics[n]["dice"])
-        if not np.isnan(dice):
-            print(f"{n}: Dice {dice:.4f} | IoU "
-                  f"{metrics.nanmean(per_ch_metrics[n]['iou']):.4f} | 像素准确率 "
-                  f"{metrics.nanmean(per_ch_metrics[n]['accuracy']):.4f}")
-        else:
+        if np.isnan(dice):
             print(f"{n}: 测试集无该通道真值")
+            continue
+        line = (f"{n}: Dice {dice:.4f} | IoU "
+                f"{metrics.nanmean(per_ch_metrics[n]['iou']):.4f} | 像素准确率 "
+                f"{metrics.nanmean(per_ch_metrics[n]['accuracy']):.4f}")
+        cd = metrics.nanmean(per_ch_metrics[n]["cldice"])
+        if not np.isnan(cd):
+            line += (f" | clDice {cd:.4f}（连通性）| 连通块 "
+                     f"{metrics.nanmean(per_ch_metrics[n]['ncomp']):.1f} 个")
+        print(line)
     print(f"根数平均绝对误差 {mae('gt_roots', 'pred_roots'):.2f} 根"
           + (f"（只在无续接片段的 {len(clean)}/{len(pairs)} 张上算: {rc:.2f} 根）"
              if clean and len(clean) < len(pairs) else "")
