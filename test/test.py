@@ -119,11 +119,15 @@ def main():
         n_cont = sum(continuation_flags(roots, max_gap=config.GT_CONT_MAX_GAP,
                                         max_angle=config.GT_CONT_MAX_ANGLE))
         other_path = find_other(args.data_dir, name)
-        # 滑窗模式下概率图本来就在原图分辨率上拼出来的，像素指标也就在原图分辨率上算
-        # （否则上采样/下采样会再引入一次插值误差）
-        w1, h1 = (w0, h0) if tile else image_io.target_size(w0, h0, size,
-                                                            config.STRIDE)
-        # GT 掩码与训练侧同一实现（三类通道），保证口径一致
+        # 像素指标**一律在原图分辨率上算**，与模型的输入尺寸无关。
+        #
+        # 原来（非滑窗时）是按**模型分辨率**算的，那让跨模型比较失效：GT 的线宽会跟着
+        # 模型尺寸缩放（--size 1024 下 1.9px、2048 下 3.7px），**细的那份更难匹配**，
+        # 于是「2048 vs 1024」比出来是 0.510 vs 0.507（看着几乎没差）；
+        # 换成同一把尺子（都按 MASK_LINE_WIDTH=10 的原图尺度画 GT）是 0.571 vs 0.528。
+        # 2026-09-25 改正 —— 代价是**与训练日志里的 val Dice 不再同一口径**
+        # （那个按模型分辨率算，用于追一条曲线的趋势）；跨模型比较必须用这个。
+        w1, h1 = w0, h0
         gt_masks, valid = build_target_masks(rsml_path, other_path,
                                             (w0, h0), (w1, h1),
                                             config.MASK_LINE_WIDTH)
@@ -153,9 +157,12 @@ def main():
 
         res = predict.predict(model, img, max_side=size,
                               stride=config.STRIDE, device=device, tile=tile)
-        # 像素指标在**模型分辨率**上算，与训练时的验证 Dice 同一口径
-        # （原图分辨率下 GT 是 5px 线、预测被上采样得较细，指标会被线宽差吃掉）
-        preds = [res["probs"][c] > 0.5 for c in range(len(res["probs"]))]
+        # 预测也搬到原图分辨率才能和 GT 比（滑窗模式下它本来就在那一层，是恒等操作）
+        def _to_orig(pb):
+            return pb if pb.shape == (h0, w0) else \
+                image_io.resize_bool_mask(pb, w0, h0)
+
+        preds = [_to_orig(res["probs"][c] > 0.5) for c in range(len(res["probs"]))]
         # 与部署同口径：起点锚定到茎（补回被泡沫环挡住的那一段，计入根长）
         st = analyze_mask_anchored(
             res["mask_counted"], res["masks"][CH_STEM],
