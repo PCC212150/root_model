@@ -30,18 +30,25 @@ datasets/root/train/                  datasets/root/test/
     └── other/
 ```
 
-| 目录 | 内容 | 说明 |
+**布局是扁平的**（2026-09-30 起）：`datasets/root/{train,test}/` 下图片与标注同层。
+`common/dataset.py` 也仍能读旧的嵌套布局（`images/` + `labels/roots` + `labels/other`），
+自动识别，不用手工搬。
+
+| 文件（以 `plant_ S062-1_20251116ST` 为例） | 内容 | 说明 |
 | --- | --- | --- |
-| `images/` | 原图（5472×3648，png/jpg） | 配对与统计都以文件名（stem）为准 |
-| `labels/roots/*.rsml` | 根系折线标注 | **必须有**，没有配对标注的图片会被跳过 |
-| `labels/other/*.json` | labelme 标注 | 可缺；缺了则该图的「茎/检查范围」两通道不参与训练 |
+| `<名>.jpg` | 原图（5472×3648） | 配对与统计都以文件名（stem）为准 |
+| `<名>.json` | labelme 标注，**一份装三通道** | 三通道缺一不可统计 |
+| `<名>.rsml` | 根系折线（**旧格式，可无**） | 根系已并入 json，此文件只在 json 里没有 root 时才被读 |
 
-两份标注的对应关系（以 `plant_ S062-1_20251116ST` 为例）：
+`<名>.json` 里的三类 shape：
 
-- `labels/roots/plant_ S062-1_20251116ST.rsml` —— 根系，每条根一段折线（RootNav/RSMLGenerator 格式）；
-- `labels/other/plant_ S062-1_20251116ST.json` —— labelme 格式，含两类 shape：
-  - `stem`（polygon）：**甘蔗茎的横截面**（图中间那个褐色截面）；
-  - `check_background`（rectangle）：**框选检查的范围**（托盘内框区域），根系统计只看框内。
+- `root`（linestrip）：**根系折线**，每条根一段 —— 2026-09-30 从 `.rsml` 并进来的；
+- `stem`（polygon）：**甘蔗茎的横截面**（图中间那个褐色截面）；
+- `check_background`（rectangle）：**框选检查的范围**（托盘内框区域），根系统计只看框内。
+
+> 并库前后真值一个字没变：转换是用 [tool/merge_annot](tool/merge_annot/readme.md) 做的，
+> 并由 [tool/check_convert](tool/check_convert/readme.md) 逐组核对过
+> （折线数 / 点数 / 坐标哈希 / 掩码哈希 / 尺寸全等）。
 
 当前规模（**2026-09-17 重导**）：**train 29 组 / 21 个植株，test 7 组 / 7 个植株**，
 两边三类标注齐全。测试集按**植株整株划出**，与训练集**植株级零重叠** ——
@@ -380,6 +387,19 @@ python inference.py --dir "D:\目标图片文件夹的路径" --mm-per-px 0.1234
 | [repair_rsml](tool/repair_rsml/readme.md) | RSML 的 `<file-key>` 与文件名不一致 | 拿去 RootNav / rsml-visualizer 里看之前 |
 | [add_suffix](tool/add_suffix/readme.md) | 批量给图片/标注加日期后缀 | 新一批数据入库时 |
 
+7）**标注格式统一**：根系从 `.rsml` 并进 labelme json（`label: "root"` + `shape_type: "linestrip"`），
+一个 json 装齐 root / stem / check_background 三个通道。
+
+| 工具 | 做什么 | 什么时候用 |
+| --- | --- | --- |
+| [merge_annot](tool/merge_annot/readme.md) | 把 `<名>.rsml` 的折线并进同名 json 的 `shapes` | **新标注用 labelme 直接画根之后**，把老数据也统一过来 |
+| [check_convert](tool/check_convert/readme.md) | 转换前后的对照：折线数 / 坐标哈希 / 掩码哈希 / 尺寸逐一比 | 跑完 `merge_annot` 之后核对，**转换本身不改真值** |
+
+> `check_convert` 还会独立断言「转换后加载器确实走 json 来源」——
+> 加载器是「json 有 root 就用 json、否则退回 rsml」，只比指标的话，
+> 转换没生效也会因为「退回 rsml」而完美通过。
+> 详见 [tool/check_convert/readme.md](tool/check_convert/readme.md) 的「为什么还要看来源」。
+
 > 两个 repair 工具都会在**目标文件夹里**写一份 `repair_*_log.txt`（记录旧值→新值，供回滚）。
 > **如果这个文件夹接下来要拿去划数据集，记得先把日志挪走** ——
 > [separate_dataset](tool/separate_dataset/readme.md) 是按「文件夹里所有文件」分组的，
@@ -425,10 +445,28 @@ GT根数 预测根数 GT总长(px) 预测总长(px) 预测各根长(px,分号分
   （见下面「背景底噪兜底」）。**这两列只要出现「否」就该人工看一眼那张图的 overlay。**行尾附 `#` 开头的参数与耗时说明。
 - `{图片名}_overlay.png` —— 原图 + 根系(红) + 茎(橙) + 检查范围(绿框)，一张看完
   （加 `--overlay-jpg` 存成 `.jpg`，写一张快 47 倍、体积小 8 倍，看结果够用）
+- `{图片名}.rsml` —— 预测根系折线，RootNav / rsml-visualizer 那条链路用
+- `{图片名}.json` —— 同一批折线的 **labelme 版本**，与**标注**同格式
 - `{图片名}_mask.png` —— 统计口径的根系掩码（**默认不存**，加 `--save-mask` 才出）
 
 > 2026-09-17 起精简：`_stem.png` / `_check.png` 不再输出（overlay 里已用颜色标出），
 > `_mask.png` 默认不存。每张图少写 3 个 5472×3648 的大 PNG，磁盘和耗时都省一截。
+
+**两种折线格式并存**（2026-09-30 加 `.json`），因为服务的工具不同，不是二选一。
+想只出一种加 `--formats rsml` 或 `--formats json`。`.json` 与标注的键序、
+`imageData: null`、换行都一致（照 labelme 的行为），所以能**把预测和标注叠在一起看**。
+
+`.json` 里的 `imagePath` 写的是**原图文件名**（不是 overlay），labelme 按它在同级目录找图 ——
+所以要看得建一个同时有图和 json 的临时目录，顺带**改个名**：
+
+```
+copy "datasets\root\test\<图片名>.jpg"        "D:\看我自己的预测\"
+copy "result\<结果目录>\<图片名>.json"        "D:\看我自己的预测\<图片名>_pred.json"
+labelme "D:\看我自己的预测"
+```
+
+> **别把它直接拷进 `datasets\root\`**：预测 json 与标注 json 同名，会撞名覆盖掉标注。
+> 就算改了名也别放那儿 —— `datasets/` 是训练数据，混进预测结果会污染划数据集和对照工具。
 
 **写图是全流程最贵的一步，不是模型。** 实测一张 5472×3648 的 overlay：
 PNG 默认压缩 **1891ms** vs 模型前向 **333ms** —— 差 5 倍，所以推理时 GPU 利用率只有

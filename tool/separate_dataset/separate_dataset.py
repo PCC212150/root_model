@@ -1,20 +1,22 @@
-"""把数据集文件夹按比例划分为 train / test / val 三份（验证集默认不分配），
-**并按项目布局把文件分门别类放好**（2026-09-17 起）。
+"""把数据集文件夹按比例划分为 train / test / val 三份（验证集默认不分配）。
 
 划分单位是「组」而不是单个文件：源文件夹里同名的一批文件算一组
-（如 `plant_ S062-1_20251116ST.jpg` / `.rsml` / `.json`），整组进同一份，
+（如 `plant_ S062-1_20251116ST.jpg` / `.json` / `.rsml`），整组进同一份，
 不会把图片和标注拆散。
 
-**源文件夹是「扁平」的**（图片、rsml、json 混在同一层，例如桌面上的
-`数据集总表\\root`），**输出是「嵌套」的**（项目 common/dataset.py 要求的布局）：
+**输出默认是「平铺」的**（2026-09-30 起，与 common/dataset.py 的布局一致）：
+
+    输出/train/   图片 + 标注（*.jpg / *.json / *.rsml）全在同一层
+    （test / val 同构）
+
+想回到 2026-09-17–09-29 之间的嵌套布局，加 `--nested`：
 
     输出/train/images/           图片
     输出/train/labels/roots/     *.rsml  根系标注
-    输出/train/labels/other/     *.json  labelme 标注（茎/检查范围，可缺）
+    输出/train/labels/other/     *.json  labelme 标注（茎/检查范围/根系折线）
     （test / val 同构）
 
-也就是说「扁平 → 嵌套」这一步转换直接在划分里做掉了，不用另外的转换脚本。
-想要过去那种「所有文件平铺在一个 split 文件夹里」的输出，加 --flat。
+两种布局 `common/dataset.py` **都能读**（自动识别），所以旧数据集不用急着搬。
 
 用法：
     python separate_dataset.py --dir "C:\\Users\\21215\\Desktop\\数据集总表\\root" --dry-run
@@ -72,8 +74,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=config.SEED, help=f"随机种子，默认 {config.SEED}")
     parser.add_argument("--move", action="store_true", help="移动文件（默认复制，源数据保留）")
     parser.add_argument("--flat", action="store_true",
-                        help="输出「平铺」布局（所有文件丢在一个 split 目录里）"
-                             "；默认是项目要的嵌套布局 images/ + labels/roots + labels/other")
+                        help="平铺布局。**2026-09-30 起这就是默认**，此参数保留只为兼容旧命令")
+    parser.add_argument("--nested", action="store_true",
+                        help="改用旧的嵌套布局 images/ + labels/roots + labels/other")
     parser.add_argument("--by-file", action="store_true",
                         help="按单个文件组划分（旧行为）。**默认按植株划分** —— 同一植株的"
                              "多个时点整株进同一侧，避免同株泄漏（见 common/dataset.py 的 plant_key）")
@@ -158,12 +161,25 @@ def dest_subdir(path: Path) -> str:
 
 
 def group_kind(files):
-    """判断一组的配对情况：'pair' 图片+rsml 齐全 / 'no_rsml' 缺标注 / 'no_image' 缺图片。"""
+    """判断一组的配对情况。
+
+    'pair'      图片 + json（**新格式**：根系折线也在这个 json 里，不需要 .rsml）
+    'pair_rsml' 图片 + 只有 .rsml（**旧格式**，还没跑过 tool/merge_annot）
+    'no_annot'  只有图片，没有任何标注
+    'no_image'  只有标注，没有图片
+    'other'     两者都没有
+
+    2026-09-30 改：原来只认 `.rsml`，于是「图片 + json 无 rsml」被判成**「缺标注」**——
+    新格式的数据走这个工具会被当成残缺数据。现在 json 与 rsml **有一个就算配对**。
+    """
     has_img = any(f.suffix.lower() in config.IMAGE_EXTS for f in files)
+    has_json = any(f.suffix.lower() == ".json" for f in files)
     has_rsml = any(f.suffix.lower() == ".rsml" for f in files)
-    if has_img and has_rsml:
+    if not has_img:
+        return "no_image" if (has_json or has_rsml) else "other"
+    if has_json:
         return "pair"
-    return "no_rsml" if has_img else ("no_image" if has_rsml else "other")
+    return "pair_rsml" if has_rsml else "no_annot"
 
 
 def split_counts(n, ratios):
@@ -217,7 +233,7 @@ def main(argv=None):
     if subdirs:
         print(f"[提示] 文件夹内有 {len(subdirs)} 个子文件夹，本工具只划分当前层的文件，子文件夹不动")
 
-    kinds = {name: 0 for name in ("pair", "no_rsml", "no_image", "other")}
+    kinds = {name: 0 for name in ("pair", "pair_rsml", "no_annot", "no_image", "other")}
     for files in groups.values():
         kinds[group_kind(files)] += 1
     n_files = sum(len(f) for f in groups.values())
@@ -238,17 +254,21 @@ def main(argv=None):
     # ---------- 划分信息 ----------
     print(f"源文件夹：{src}")
     print(f"共 {len(groups)} 组 / {n_files} 个文件"
-          f"（图片+rsml 齐全 {kinds['pair']} 组，缺标注 {kinds['no_rsml']} 组，"
-          f"缺图片 {kinds['no_image']} 组，其他 {kinds['other']} 组）")
+          f"（新格式 图片+json {kinds['pair']} 组，旧格式 图片+rsml {kinds['pair_rsml']} 组，"
+          f"缺标注 {kinds['no_annot']} 组，缺图片 {kinds['no_image']} 组，"
+          f"其他 {kinds['other']} 组）")
     if args.by_file:
         print("划分单位：单个文件组（--by-file）")
     else:
         print(f"划分单位：植株 —— {len(units)} 株"
               + (f"（{len(groups)} 组归并而来，同株的多个时点整株进同一侧）"
                  if len(units) != len(groups) else ""))
-    if kinds["pair"] != len(groups):
-        print("[提示] 有组的图片/标注不成对，检查源文件夹是否漏拷了 .rsml 或图片"
-              "（训练要求图片与同名 rsml 同目录）")
+    if kinds["no_annot"]:
+        print(f"[提示] {kinds['no_annot']} 组图片没有任何标注（既无 .json 也无 .rsml），"
+              f"检查源文件夹是否漏拷 —— 训练要求图片与同名标注同目录")
+    if kinds["pair_rsml"]:
+        print(f"[提示] {kinds['pair_rsml']} 组还是**旧格式**（根系在 .rsml 里）。可以照常划分，"
+              f"但建议先跑 tool\\merge_annot 把根系并进 json，让全库统一格式")
     # json 是茎/检查范围两个通道的标注，**可以缺**：缺的图只训练根系通道。
     # 但缺太多会让茎/检查范围两个通道学不好 —— 它们直接决定根系统计的准确性
     # （统计范围靠检查范围框限定），所以这里明确报出覆盖率。
@@ -298,7 +318,7 @@ def main(argv=None):
         dst.mkdir(parents=True, exist_ok=True)
         for gname in assign[name]:
             for path in groups[gname]:
-                sub = "" if args.flat else dest_subdir(path)
+                sub = dest_subdir(path) if args.nested else ""
                 target = (dst / sub / path.name) if sub else (dst / path.name)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if args.move:
@@ -310,9 +330,10 @@ def main(argv=None):
     action = "移动" if args.move else "复制"
     print(f"\n完成：{action} {sum(len(groups[n]) for name in SUBSETS for n in assign[name])} 个文件到 {out_dir}")
     print(f"划分记录：{out_dir / 'split.txt'}")
-    layout = "平铺（--flat）" if args.flat else "images/ + labels/roots + labels/other"
+    layout = "嵌套（--nested）images/ + labels/roots + labels/other" if args.nested \
+        else "平铺（图片与标注同层）"
     print(f"布局：{layout}")
-    if not args.flat and out_dir == config.ROOT_DATA_DIR:
+    if out_dir == config.ROOT_DATA_DIR:
         # 直接落在 datasets/root 里，已经是训练能直接读的布局，不用再拷
         print("提示：输出就是 datasets/root 本身，训练/测试脚本可以直接跑，"
               "不需要再拷文件")

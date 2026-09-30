@@ -1,12 +1,18 @@
-"""labelme 标注（labels/other/*.json）解析：茎横截面 + 检查范围。
+"""labelme 标注（labels/other/*.json）解析：根系折线 + 茎横截面 + 检查范围。
 
 json 结构（labelme 6.x）：
     {"version","flags","shapes":[{label,shape_type,points,...}],
      "imagePath","imageData","imageHeight","imageWidth"}
 
-本项目只用两类 label：
+本项目用三类 label：
+    root              根系折线（linestrip）—— **2026-09-30 起并入本文件**
     stem              甘蔗茎的横截面（polygon）
     check_background  框选检查的范围（rectangle，两点轴对齐）
+
+历史：根系原先单独存在 `.rsml`（RootNav 的 XML）里，2026-09-30 起统一进本 json，
+三通道一份文件。`root` 折线要按 `rsml_parse.parse_rsml` 的同款口径处理
+（**少于 2 个点的丢弃**），否则同一份标注在新旧两种格式下会算出不同的掩码 ——
+见 [tool/merge_annot](../tool/merge_annot/readme.md)。
 
 解析结果统一为**原图坐标**下的矢量（点列 / 外接矩形），画掩码时按目标尺寸换算
 （见 common/gt_mask.py），这样同一份标注可以按任意输入分辨率绘制。
@@ -21,6 +27,10 @@ from pathlib import Path
 
 STEM_LABEL = "stem"
 CHECK_LABEL = "check_background"
+ROOT_LABEL = "root"
+# labelme 里画折线用 linestrip；line / polygon 也接住 —— 都是「一串点连起来」，
+# 与 rsml 的 <point> 序列语义相同，没必要因为画图工具的选择不同就丢掉标注。
+ROOT_SHAPE_TYPES = ("linestrip", "line", "polygon")
 
 
 @dataclass
@@ -30,11 +40,17 @@ class OtherLabels:
     path: Path = None
     stems: list = field(default_factory=list)       # [[(x, y), ...], ...] 茎多边形
     check_rect: tuple = None                        # (x0, y0, x1, y1) 检查范围外接矩形
+    roots: list = field(default_factory=list)       # [[(x, y), ...], ...] 根系折线（>=2 点）
     info: dict = field(default_factory=dict)        # 自检信息（shape 数 / 面积占比 / 告警）
 
     @property
     def ok(self) -> bool:
-        """两类标注都解析到了才为 True（缺任一类的图，训练时会屏蔽对应通道的损失）。"""
+        """两类标注都解析到了才为 True（缺任一类的图，训练时会屏蔽对应通道的损失）。
+
+        **只看 stem / check，不含 roots**：这个属性管的是「这两条通道的损失要不要屏蔽」，
+        而**零根是合法的负样本**（真值里就是「这张图没有根」，见 plant_S003-3），
+        不能拿「roots 为空」判成缺标注。
+        """
         return bool(self.stems) and self.check_rect is not None
 
 
@@ -93,7 +109,17 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
         if len(pts) != len(s.get("points") or []):
             warns.append(f"有 {len(s.get('points') or []) - len(pts)} 个非有限坐标点被丢弃")
 
-        if label == STEM_LABEL:
+        if label == ROOT_LABEL:
+            # 与 rsml_parse.py:52 同口径：少于 2 个点无法构成折线，丢弃。
+            # 两格式必须一致，否则同一份标注换个格式就会算出不同的掩码。
+            if len(pts) >= 2:
+                lab.roots.append(pts)
+                st = (s.get("shape_type") or "").strip()
+                if st not in ROOT_SHAPE_TYPES:
+                    warns.append(f"root 的 shape_type={st!r} 不是折线，已按折线读取")
+            else:
+                warns.append(f"root 只有 {len(pts)} 个点，忽略")
+        elif label == STEM_LABEL:
             if len(pts) >= 3:
                 lab.stems.append(pts)
             else:
@@ -113,6 +139,7 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
     lab.info = {
         "n_shapes": len(shapes),
         "labels": labels_seen,
+        "n_root": len(lab.roots),
         "n_stem": len(lab.stems),
         "check_rect": lab.check_rect,
         "warns": warns,

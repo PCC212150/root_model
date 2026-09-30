@@ -44,10 +44,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
 from common import ckpt, image_io, naming, predict  # noqa: E402
-from common.dataset import CH_STEM, discover_pairs  # noqa: E402
+from common.dataset import CH_STEM, discover_pairs, load_annot  # noqa: E402
 from common.gt_mask import draw_mask_from_roots  # noqa: E402
 from common.image_io import prob_to_orig_mask, prob_to_orig_mask_hysteresis  # noqa: E402
-from common.rsml_parse import parse_rsml, root_stats  # noqa: E402
+from common.rsml_parse import root_stats  # noqa: E402
 from common.skeleton_stats import (anchor_gain_for_trace,  # noqa: E402
                                    stem_anchor_tolerance, _skeleton_adj,
                                    _strands_from_adj)
@@ -149,7 +149,7 @@ def main():
     if args.limit:
         pairs = pairs[:args.limit]
     if not pairs:
-        sys.exit(f"[错误] {args.dir} 下没有「图片 + rsml」配对数据")
+        sys.exit(f"[错误] {args.dir} 下没有「图片 + 标注」配对数据")
     print(f"数据集: {args.dir} | 图片 {len(pairs)} 张" + (f"（limit={args.limit}）" if args.limit else ""))
     print(f"网格: low={lows} × spur={spurs} × min_len={min_lens} × erode={erodes} "
           f"× normalize={['on' if n else 'off' for n in norms]} "
@@ -183,10 +183,10 @@ def main():
     t0 = time.time()
     checked = False
 
-    for si, (name, img_path, rsml_path) in enumerate(pairs, 1):
+    for si, (name, img_path, _annot_path) in enumerate(pairs, 1):
         img = image_io.load_rgb(img_path)
         h0, w0 = img.shape[:2]
-        roots = parse_rsml(rsml_path)
+        roots = load_annot(args.dir, name, (w0, h0)).roots
         n_gt, lens_gt, total_gt = root_stats(roots)
         gt_stats = {"total": n_gt, "total_len": total_gt}
         check_box = None

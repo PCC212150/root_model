@@ -1,12 +1,26 @@
-"""PyTorch Dataset：图片 + RSML（根系）+ labelme json（茎/检查范围）三通道真值。
+"""PyTorch Dataset：图片 + 三通道真值（根系折线 / 茎 / 检查范围）。
 
-数据布局（train/test 同构）：
-    <data_dir>/images/<名>.png|jpg          原图
-    <data_dir>/labels/roots/<名>.rsml       根系折线（必须有，配对依据）
-    <data_dir>/labels/other/<名>.json       茎横截面 + 检查范围（可缺）
+数据布局（train/test 同构）——**两种都支持，自动识别**：
+
+    扁平（2026-09-30 起，当前用法）：
+        <data_dir>/<名>.jpg|png     原图
+        <data_dir>/<名>.json        茎横截面 + 检查范围 + 根系折线（三通道一份文件）
+        <data_dir>/<名>.rsml        根系折线（**旧格式**，可选）
+
+    分目录（旧布局，仍然能读）：
+        <data_dir>/images/<名>.jpg
+        <data_dir>/labels/other/<名>.json
+        <data_dir>/labels/roots/<名>.rsml
+
+根系折线有两种存放格式，`load_annot()` 统一读取：
+    · 新格式：json 里 `label="root"` 的 linestrip，三通道一份文件；
+    · 旧格式：单独的 `.rsml`（RootNav 的 XML）。
+新格式优先；**退回旧格式时会大声告警** —— 静默回退会让「格式迁移是否生效」无从判断
+（新旧两条路读出来的东西一模一样，指标自然也一样），
+见 [tool/merge_annot](../tool/merge_annot/readme.md)、[tool/check_convert](../tool/check_convert/readme.md)。
 
 目标张量 (3, H, W) 的通道顺序见 config.CLASS_NAMES：
-    0 = root   根系（RSML 折线画线，线宽按比例换算）
+    0 = root   根系（折线画线，线宽按比例换算）
     1 = stem   茎横截面（labelme polygon 填充）
     2 = check  检查范围（labelme rectangle 填充；缺标注时置全 True = 不做限制）
 
@@ -15,6 +29,7 @@
 """
 import math
 import random
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +39,8 @@ from torch.utils.data import Dataset
 
 import config
 from common import gt_mask, image_io
-from common.labelme import parse_other
-from common.rsml_parse import parse_rsml
+from common.labelme import OtherLabels, parse_other
+from common.rsml_parse import Root, parse_rsml
 
 # 通道序号（与 config.CLASS_NAMES 一致）
 CH_ROOT, CH_STEM, CH_CHECK = 0, 1, 2
@@ -39,43 +54,134 @@ def _images_dir(data_dir) -> Path:
 
 
 def _roots_dir(data_dir) -> Path:
-    """根系标注目录：labels/roots，兼容旧的 labels/root（单数）。"""
+    """旧格式的根系标注目录：`labels/roots`（兼容旧命名 `labels/root`）。
+
+    **没有 labels/ 目录时回退到 data_dir 本身** —— 2026-09-30 起数据集改成扁平布局
+    （图片与标注同层，见模块 docstring），此时 `<名>.rsml` 就放在图片旁边。
+    """
     from config import ROOTS_LABEL_SUBDIR, ROOTS_LABEL_SUBDIR_ALT
     d = Path(data_dir)
     for name in (ROOTS_LABEL_SUBDIR, ROOTS_LABEL_SUBDIR_ALT):
         sub = d / name
         if sub.is_dir():
             return sub
-    return d / ROOTS_LABEL_SUBDIR
+    return d
+
+
+def _other_dir(data_dir) -> Path:
+    """labelme 标注目录（新格式下根系也在这里）。
+
+    同样回退到 data_dir 本身：扁平布局下 `<名>.json` 与图片同层。
+    """
+    from config import OTHER_LABEL_SUBDIR
+    d = Path(data_dir)
+    sub = d / OTHER_LABEL_SUBDIR
+    return sub if sub.is_dir() else d
+
+
+def find_other(data_dir, stem):
+    """找该图的 labelme 标注（茎/检查范围/新格式的根系）；没有返回 None。"""
+    p = _other_dir(data_dir) / f"{stem}.json"
+    return p if p.exists() else None
 
 
 def discover_pairs(data_dir, image_exts=None) -> list:
-    """返回 [(stem, 图片路径, rsml路径), ...]：图片必须有同名 .rsml 配对。
+    """返回 [(stem, 图片路径, 标注路径), ...]：图片要有**至少一个**标注文件才配对。
 
-    目录布局见模块 docstring；找不到 rsml 的图片会被跳过（不是报错，便于混放）。
+    配对条件（2026-09-30 放宽）：`labels/other/<名>.json` 或 `labels/roots/<名>.rsml`
+    **有一个就算**。第三项返回实际存在的那个（优先 json），但**它只是「有标注」的证据**——
+    根系到底从哪读由 `load_annot()` 决定。
+
+    这里刻意**不去读 json 内容**：判断「json 里有没有 root 折线」要解析整个文件
+    （转换后单个 ~90KB），而本函数被 train / test / tune_stats / chain_diag 四条路径调用，
+    每次都扫一遍不值当。停在 `stat()` 级别即可，真正的判定在 `load_annot` 里做一次。
+
+    注意语义变化：过去「有图片、无 rsml」的图会被**静默跳过**；现在只要还有 json 就算数，
+    只是那个 json 若没有 root 折线，root 通道会是空的（`_warn_empty_root` 会就此告警）。
     """
     if image_exts is None:
         from config import IMAGE_EXTS
         image_exts = IMAGE_EXTS
     data_dir = Path(data_dir)
     img_dir = _images_dir(data_dir)
-    roots_dir = _roots_dir(data_dir)
     if not img_dir.is_dir():
         return []
+    roots_dir = _roots_dir(data_dir)
+    other_dir = _other_dir(data_dir)
     pairs = []
     for img_path in sorted(p for p in img_dir.iterdir()
                            if p.suffix.lower() in image_exts):
+        json_path = other_dir / f"{img_path.stem}.json"
         rsml_path = roots_dir / f"{img_path.stem}.rsml"
-        if rsml_path.exists():
+        if json_path.exists():
+            pairs.append((img_path.stem, img_path, json_path))
+        elif rsml_path.exists():
             pairs.append((img_path.stem, img_path, rsml_path))
     return pairs
 
 
-def find_other(data_dir, stem):
-    """找该图的 labelme 标注（茎/检查范围）；没有返回 None。"""
-    from config import OTHER_LABEL_SUBDIR
-    p = Path(data_dir) / OTHER_LABEL_SUBDIR / f"{stem}.json"
-    return p if p.exists() else None
+@dataclass
+class Annot:
+    """一个样本的全部标注。`roots` 的来源见 `source`。"""
+
+    stem: str
+    orig_size: tuple = None                 # (w0, h0) 磁盘上图片的实际尺寸
+    roots: list = field(default_factory=list)   # list[Root]（json/rsml 两条路产出同型对象）
+    lab: OtherLabels = None                 # 茎 / 检查范围（没有 json 时是空壳）
+    source: str = "json"                    # "json"=新格式 | "rsml"=旧格式（会大声告警）
+    json_path: Path = None
+    rsml_path: Path = None
+
+
+_warned_legacy = set()
+
+
+def _warn_legacy(stem, json_path, rsml_path, n_roots):
+    """旧格式仍生效时的告警。同一个文件只吵一次。
+
+    **这不是「贴心的提示」，是让格式迁移可验证的前提。** 静默回退的话，
+    「转换前后指标逐位相同」会因为两边读的是同一份 rsml 而永远成立——
+    转换哪怕一个字节都没改，验证也会通过。
+    """
+    key = str(rsml_path)
+    if key in _warned_legacy:
+        return
+    _warned_legacy.add(key)
+    why = ("labels/other 里没有对应 json" if json_path is None
+           else f"{json_path.name} 里没有 root 折线")
+    print(f"[警告] 旧格式仍在生效：{stem} —— {why}，"
+          f"正从 {Path(rsml_path).name} 读 {n_roots} 条根系折线。\n"
+          f"        新格式要求 root 也写进 labels/other/<名>.json（labelme linestrip）。\n"
+          f"        转换： python tool\\merge_annot\\merge_annot.py --dir \"<数据集目录>\" -r --dry-run",
+          flush=True)
+
+
+def load_annot(data_dir, stem, orig_size=None, verbose=True) -> Annot:
+    """读取一个样本的全部标注：**json（含 root 折线）优先，退回 .rsml**。
+
+    orig_size=(w, h) 会拿去校验 json 里记的尺寸与磁盘图片是否一致——
+    标注画在别的尺寸上会让掩码整体错位，那种情况必须报错而不是静默继续。
+
+    返回的 `source` 标注了根系实际来自哪条路，调用方（尤其是验证脚本）应当据此判断
+    格式迁移是否真的生效。
+    """
+    json_path = find_other(data_dir, stem)
+    rsml_path = _roots_dir(data_dir) / f"{stem}.rsml"
+    rsml_path = rsml_path if rsml_path.exists() else None
+    lab = (parse_other(json_path, image_size=orig_size, verbose=verbose)
+           if json_path is not None else OtherLabels(path=None, info={}))
+
+    if lab.roots:
+        return Annot(stem, orig_size, [Root(points=p) for p in lab.roots], lab,
+                     "json", json_path, rsml_path)
+    if rsml_path is not None:
+        roots = parse_rsml(rsml_path)
+        if verbose:
+            _warn_legacy(stem, json_path, rsml_path, len(roots))
+        return Annot(stem, orig_size, roots, lab, "rsml", json_path, rsml_path)
+    # 有 json 但没有 root 折线、也没有 rsml：照常当「这张图没有根」的负样本，
+    # 由 _warn_empty_root 去提醒（它可能是合法的负样本，也可能是漏标）。
+    return Annot(stem, orig_size, [], lab, "json", json_path, None)
 
 
 def plant_key(name: str) -> str:
@@ -149,24 +255,28 @@ def _jitter(img: np.ndarray) -> np.ndarray:
 _warned_empty_root = set()
 
 
-def _warn_empty_root(rsml_path):
-    """同一个文件只吵一次（数据集构造 + 评测会对同一张图问好几遍）。
+def _warn_empty_root(annot):
+    """同一个样本只吵一次（数据集构造 + 评测会对同一张图问好几遍）。
 
     **只是提醒，不改变行为**：这种图照常按「无根」负样本参与训练。
     """
-    key = str(rsml_path)
+    key = (str(annot.json_path or ""), str(annot.rsml_path or ""))
     if key in _warned_empty_root:
         return
     _warned_empty_root.add(key)
-    print(f"[提示] {Path(rsml_path).name} 里没有任何根系几何（<geometry>），"
-          f"将按「这张图没有根」参与训练。\n"
-          f"        如果确实没有根（合法负样本），忽略本条即可；\n"
+    src = (Path(annot.rsml_path).name if annot.source == "rsml" and annot.rsml_path
+           else Path(annot.json_path).name if annot.json_path else annot.stem)
+    print(f"[提示] {src} 里没有任何根系折线，将按「这张图没有根」参与训练。\n"
+          f"        如果确实没有根（合法负样本，如 plant_S003-3），忽略本条即可；\n"
           f"        如果是**漏标**（画了没保存/忘了画），请补标或把这张图移出数据集 ——"
           f"那种情况下会把模型教坏。")
 
 
-def build_target_masks(rsml_path, other_path, orig_size, target_size, mask_width):
+def build_target_masks(annot, target_size, mask_width):
     """画三通道真值掩码，返回 (masks[h,w,3] bool, chan_valid[3] float)。
+
+    annot: `load_annot()` 的返回值；原图尺寸从 `annot.orig_size` 取 ——
+           刻意不做成参数，免得调用方传一个跟图片对不上的尺寸进来。
 
     test.py 评测时复用这同一份实现，保证「训练真值」与「评测真值」口径一致。
 
@@ -174,62 +284,57 @@ def build_target_masks(rsml_path, other_path, orig_size, target_size, mask_width
     并把对应通道标为「无效」——训练时该通道的损失会被屏蔽，避免模型学成「这里没有框」。
     """
     w1, h1 = target_size
+    orig_size = annot.orig_size
     masks = np.zeros((h1, w1, 3), dtype=bool)
     valid = np.zeros(3, dtype=np.float32)
 
     line_w = gt_mask.target_line_width(mask_width, orig_size, target_size)
-    roots = parse_rsml(rsml_path)
     polys = [gt_mask.scale_points(r.points, orig_size, target_size)
-             for r in roots if len(r.points) >= 2]
+             for r in annot.roots if len(r.points) >= 2]
     masks[:, :, CH_ROOT] = gt_mask.draw_polylines_at(polys, target_size, line_w)
 
     # 根系标注是配对前提，但**文件存在 ≠ 里面画了东西**：RSMLGenerator 里没标就保存会留下
-    # 一个没有 <geometry> 的空壳（如 560 字节、0 个控制点）。
+    # 一个没有 <geometry> 的空壳（如 560 字节、0 个控制点）；新格式下则是一个
+    # 没有 root 形状的 json。
     # 这种图**照常当「无根」负样本参与训练**（valid 保持 1）—— 实测数据集里的
     # plant_S003-3_20251116ST 就是真·没有根的合法样本，用户确认过。
     # 但仍要告警一次：它也可能是「忘记画就保存」的漏标，那种情况下会把模型教坏，得让人看见。
     valid[CH_ROOT] = 1.0
     if not masks[:, :, CH_ROOT].any():
-        _warn_empty_root(rsml_path)
+        _warn_empty_root(annot)
 
-    if other_path is not None:
-        lab = parse_other(other_path, image_size=orig_size)
-        if lab.stems:
-            masks[:, :, CH_STEM] = gt_mask.draw_polygons_at(
-                [gt_mask.scale_points(p, orig_size, target_size) for p in lab.stems],
-                target_size)
-            valid[CH_STEM] = 1.0
-        if lab.check_rect is not None:
-            (x0, y0), (x1, y1) = gt_mask.scale_points(
-                [(lab.check_rect[0], lab.check_rect[1]),
-                 (lab.check_rect[2], lab.check_rect[3])], orig_size, target_size)
-            masks[:, :, CH_CHECK] = gt_mask.draw_rects_at([(x0, y0, x1, y1)],
-                                                          target_size)
-            valid[CH_CHECK] = 1.0
-    else:
-        masks[:, :, CH_CHECK] = True
-    if valid[CH_CHECK] == 0:                   # 有 json 但没有检查框：不限制统计范围
+    lab = annot.lab
+    if lab.stems:
+        masks[:, :, CH_STEM] = gt_mask.draw_polygons_at(
+            [gt_mask.scale_points(p, orig_size, target_size) for p in lab.stems],
+            target_size)
+        valid[CH_STEM] = 1.0
+    if lab.check_rect is not None:
+        (x0, y0), (x1, y1) = gt_mask.scale_points(
+            [(lab.check_rect[0], lab.check_rect[1]),
+             (lab.check_rect[2], lab.check_rect[3])], orig_size, target_size)
+        masks[:, :, CH_CHECK] = gt_mask.draw_rects_at([(x0, y0, x1, y1)],
+                                                      target_size)
+        valid[CH_CHECK] = 1.0
+    if valid[CH_CHECK] == 0:                   # 没有检查框：不限制统计范围
         masks[:, :, CH_CHECK] = True
     return masks, valid
 
 
-def build_gt_stem_mask(other_path, orig_size):
-    """只画 **stem 通道**、且**在原图分辨率**上的真值掩码；无标注返回 None。
+def build_gt_stem_mask(annot):
+    """只画 **stem 通道**、且**在原图分辨率**上的真值掩码；无茎标注返回 None。
 
-    给「起点锚定」的真值侧用（见 skeleton_stats.anchor_roots_to_stem）：RSML 折线的
+    给「起点锚定」的真值侧用（见 skeleton_stats.anchor_roots_to_stem）：折线的
     坐标是原图系，所以锚定必须在同一个坐标系里做，不能拿模型分辨率下画的掩码去比。
 
     比 build_target_masks 便宜得多 —— 它把根系折线也画一遍，那种 5472x3648 的图
     单是画折线就要好几百毫秒，而这里只画茎的多边形。
     """
-    if other_path is None:
+    if annot is None or annot.lab is None or not annot.lab.stems:
         return None
-    lab = parse_other(other_path, image_size=orig_size)
-    if not lab.stems:
-        return None
+    o = annot.orig_size
     return gt_mask.draw_polygons_at(
-        [gt_mask.scale_points(p, orig_size, orig_size) for p in lab.stems],
-        orig_size)
+        [gt_mask.scale_points(p, o, o) for p in annot.lab.stems], o)
 
 
 def _annot_bbox(masks):
@@ -301,26 +406,26 @@ class RootDataset(Dataset):
 
         self.items = []
         n_no_other = 0
+        n_legacy = 0
         bytes_full = 0
-        for name, img_path, rsml_path in pairs:
+        for name, img_path, _annot_path in pairs:
             img = image_io.load_rgb(img_path)
             h0, w0 = img.shape[:2]
-            other_path = find_other(self.data_dir, name)
+            annot = load_annot(self.data_dir, name, (w0, h0))
+            n_legacy += annot.source == "rsml"
             if self.crop or self.full:
                 if self.crop and self.crop > min(w0, h0):
                     raise ValueError(f"crop={self.crop} 比 {name} 的短边({min(w0, h0)})还大，"
                                      f"裁不出块来")
                 # 掩码在**原图分辨率**上画（orig=target），裁块/整图时坐标天然对齐
-                masks, valid = build_target_masks(rsml_path, other_path,
-                                                  (w0, h0), (w0, h0), mask_width)
+                masks, valid = build_target_masks(annot, (w0, h0), mask_width)
                 bytes_full += img.nbytes + masks.nbytes
                 item = {"name": name, "img": img, "masks": masks, "valid": valid,
                         "fill": _corner_fill(img),
                         "bbox": _annot_bbox(masks) if self.crop else None}
             else:
                 w1, h1 = image_io.target_size(w0, h0, max_side, stride)
-                masks, valid = build_target_masks(rsml_path, other_path,
-                                                  (w0, h0), (w1, h1), mask_width)
+                masks, valid = build_target_masks(annot, (w1, h1), mask_width)
                 item = {"name": name,
                         "img": image_io.resize_rgb(img, w1, h1),   # (h1,w1,3) uint8
                         "masks": masks,                            # (h1,w1,3) bool
@@ -340,6 +445,10 @@ class RootDataset(Dataset):
         if n_no_other:
             print(f"[警告] {n_no_other} 张图缺 stem/check 标注（labels/other 里没有对应 "
                   f"json），训练时这两个通道的损失会被屏蔽。")
+        if n_legacy:
+            print(f"[警告] {n_legacy} / {len(self.items)} 张图仍用**旧格式**（根系在 .rsml 里）。\n"
+                  f"        建议跑一次 tool\\merge_annot 把根系并进 json —— 新旧混用时"
+                  f"「有 json 却没有根」的样本最容易被漏掉。")
 
     def __len__(self):
         return len(self.items) * self.repeat

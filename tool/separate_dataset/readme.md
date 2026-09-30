@@ -1,24 +1,26 @@
 # 数据集划分工具（train / test / val）
 
-目的：把一个**扁平**的数据集文件夹按比例划分为 train / test / val，并**输出成项目要的嵌套布局**
-（2026-09-17 起）。
+目的：把一个数据集文件夹按比例划分为 train / test / val。
 
-   源（扁平）                          输出（嵌套）
-   root/                               root/train/images/
-   ├── plant_ S062-1_xxx.jpg      →    root/train/labels/roots/
-   ├── plant_ S062-1_xxx.rsml          root/train/labels/other/
-   ├── plant_ S062-1_xxx.json          root/test/…（同构）
-   └── …
+**输出默认是「平铺」的**（2026-09-30 起，与 `common/dataset.py` 的布局一致）：
 
-也就是说「扁平 → 嵌套」这一步转换直接在划分里做掉了，不需要另外的转换脚本。
-想要过去那种所有文件平铺在一个 split 目录里的输出，加 `--flat`。
+   源                                  输出
+   root/                               root/train/
+   ├── plant_ S062-1_xxx.jpg      →    ├── plant_ S062-1_xxx.jpg
+   ├── plant_ S062-1_xxx.json          ├── plant_ S062-1_xxx.json
+   ├── plant_ S062-1_xxx.rsml          ├── plant_ S062-1_xxx.rsml
+   └── …                               root/test/…（同构）
+
+想回到 2026-09-17–09-29 之间的嵌套布局（`images/` + `labels/roots` + `labels/other`），
+加 `--nested`；`--flat` 保留为兼容别名（它现在就是默认）。
+两种布局 `common/dataset.py` **都能读**，所以旧数据集不用急着搬。
 
 **划分单位默认是「植株」而不是单个文件**：同一植株的多个时点整株进同一侧
 （`plant_ S062-1_20251116ST` 和 `..._20251126ST` 是同一株的两个时点，分到两边就是同株泄漏）。
 植株识别用 [common/dataset.py](../../common/dataset.py) 的 `plant_key`。想按单个文件划分加 `--by-file`。
 
-无论按哪种单位，**同名的图片/rsml/json 永远在一组、不会被拆散** —— 拆散会导致训练时
-整组数据被丢掉（`discover_pairs` 要求图片与同名 `.rsml` 在同一侧）。
+无论按哪种单位，**同名的图片/标注永远在一组、不会被拆散** —— 拆散会导致训练时
+整组数据被丢掉（`discover_pairs` 要求图片与同名标注在同一侧）。
 
 ## 运行环境
 
@@ -119,18 +121,16 @@ copy <输出目录>\test\*    datasets\root\test\
 
 即 [config.py](../../config.py) 里的 `TRAIN_DATA_DIR` / `TEST_DATA_DIR`。
 
-> **注意：本项目的数据集目录已经改成「图片与标注分开放」**（本工具的输出仍是混放，
-> 与本项目当前布局不同）：
+> **本工具的输出布局与项目当前布局一致**（都是平铺，图片与标注同层），
+> 拷进去就能直接训，不需要按扩展名再归位。
+> `datasets\root\{train,test}\` 下应该长这样：
 > ```
-> datasets\root\train\
-> ├── images\            # 图片
-> └── labels\
->     ├── roots\         # 根系 rsml
->     └── other\         # 茎/检查范围的 labelme json
+> plant_ S062-1_20251116ST.jpg
+> plant_ S062-1_20251116ST.json      # 茎 / 检查范围 / 根系折线
+> plant_ S062-1_20251116ST.rsml      # （可无）旧格式的根系，只在 json 没有 root 时才读
 > ```
-> 拷进来后需要按扩展名分别归位（图片放 `images\`，`.rsml` 放 `labels\roots\`，
-> `.json` 放 `labels\other\`）。训练代码对旧布局（混放）仍能读，只是标注
-> `labels/other` 那两类会缺失。
+> 旧的嵌套布局（`images/` + `labels/roots` + `labels/other`）训练代码**也还能读**，
+> 所以已经拷进去的老数据不用搬。
 
 ## 常见问题
 

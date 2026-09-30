@@ -25,8 +25,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import config  # noqa: E402
 from common import ckpt, image_io, metrics, naming, predict  # noqa: E402
 from common.dataset import (CH_CHECK, CH_ROOT, CH_STEM,  # noqa: E402
-                            build_target_masks, discover_pairs, find_other)
-from common.rsml_parse import parse_rsml, root_stats  # noqa: E402
+                            build_target_masks, discover_pairs, load_annot)
+from common.rsml_parse import root_stats  # noqa: E402
 from common.skeleton_stats import (analyze_mask_anchored,  # noqa: E402
                                    continuation_flags)
 
@@ -95,7 +95,8 @@ def main():
 
     pairs = discover_pairs(args.data_dir)
     if not pairs:
-        print(f"[错误] {args.data_dir} 下没有 图片+rsml 配对数据")
+        print(f"[错误] {args.data_dir} 下没有「图片+标注」配对数据"
+              f"（要 labels/other/<名>.json 或 labels/roots/<名>.rsml）")
         sys.exit(1)
 
     mm = config.MM_PER_PX if args.mm_per_px is None else args.mm_per_px
@@ -106,10 +107,13 @@ def main():
     per_ch_metrics = {n: {"iou": [], "dice": [], "accuracy": [], "cldice": [],
                           "ncomp": []} for n in names}
     t_start = time.time()
-    for name, img_path, rsml_path in pairs:
+    n_legacy = 0
+    for name, img_path, _annot_path in pairs:
         img = image_io.load_rgb(img_path)
         h0, w0 = img.shape[:2]
-        roots = parse_rsml(rsml_path)
+        annot = load_annot(args.data_dir, name, (w0, h0))
+        n_legacy += annot.source == "rsml"
+        roots = annot.roots
         gt_count, gt_lens, gt_total_raw = root_stats(roots)
         # 标注质量标记：交叉处断开重画的「续接片段」有多少条。
         # root_stats 数的就是折线条数（= RSML 的 ID 数），而续接片段会被当成额外的根
@@ -118,7 +122,6 @@ def main():
         # 详见 common/skeleton_stats.continuation_flags 与 tool/chain_diag/readme.md。
         n_cont = sum(continuation_flags(roots, max_gap=config.GT_CONT_MAX_GAP,
                                         max_angle=config.GT_CONT_MAX_ANGLE))
-        other_path = find_other(args.data_dir, name)
         # 像素指标**一律在原图分辨率上算**，与模型的输入尺寸无关。
         #
         # 原来（非滑窗时）是按**模型分辨率**算的，那让跨模型比较失效：GT 的线宽会跟着
@@ -128,18 +131,14 @@ def main():
         # 2026-09-25 改正 —— 代价是**与训练日志里的 val Dice 不再同一口径**
         # （那个按模型分辨率算，用于追一条曲线的趋势）；跨模型比较必须用这个。
         w1, h1 = w0, h0
-        gt_masks, valid = build_target_masks(rsml_path, other_path,
-                                            (w0, h0), (w1, h1),
-                                            config.MASK_LINE_WIDTH)
+        gt_masks, valid = build_target_masks(annot, (w1, h1), config.MASK_LINE_WIDTH)
         # ---- 「理想掩码」对照：真值掩码走**与预测逐字相同**的那条流水线 ----
         # 为什么需要它：预测总长 = 「掩码 → 骨架 → 分链 → 起点锚定」的输出，而这条
         # 流水线本身不是恒等的（实测 骨架化 −1.9% / 剪枝 −3.4% / 锚定 +10.9 个百分点，
         # 见 tool/chain_diag）。直接拿预测总长比 RSML 折线长，混着口径差；比这条流水线
         # 在**掩码完美**时的输出，剩下的才是模型真正的贡献。
         # 所以主指标是「预测 vs 理想」，副指标是「理想 vs 标注」（= 流水线固有偏差）。
-        gt_masks_orig, _ = build_target_masks(rsml_path, other_path,
-                                              (w0, h0), (w0, h0),
-                                              config.MASK_LINE_WIDTH)
+        gt_masks_orig, _ = build_target_masks(annot, (w0, h0), config.MASK_LINE_WIDTH)
         gt_orig_root = np.ascontiguousarray(gt_masks_orig[:, :, CH_ROOT])
         if valid[CH_CHECK] > 0:      # 与预测同口径：只在检查范围内统计
             gt_orig_root = gt_orig_root & np.ascontiguousarray(
@@ -233,6 +232,8 @@ def main():
 
     summary = [
         "",
+        f"# 真值来源：json 里 root 折线 {len(pairs) - n_legacy} 图 | 旧格式 .rsml {n_legacy} 图"
+        + ("（建议跑 tool\\merge_annot 统一）" if n_legacy else ""),
         f"# ===== 汇总（{len(pairs)} 图平均） =====",
         f"# 根数: GT平均 {avg('gt_roots'):.1f} vs 预测平均 {avg('pred_roots'):.1f} "
         f"(平均绝对误差 {mae('gt_roots', 'pred_roots'):.2f} 根) —— ⚠️ 见下条，"

@@ -46,10 +46,14 @@ RESULT_DIR = PROJECT_ROOT / "result"      # 推理结果根目录
 #   从 23 组涨到 52 组）。以前那份 CSV 只能当历史看。
 # ⚠️ 以后再标新植株，要**重划并把新划分写回这里** —— 别悄悄换测试集。
 
-# 数据集内部结构（train/test 同构，图片与标注分目录存放）：
-#   images/           原图（png/jpg，可混用）
-#   labels/roots/     根系 RSML 折线标注（与图片同名）
-#   labels/other/     茎横截面 + 检查范围的 labelme json（与图片同名，可缺）
+# 数据集内部结构（train/test 同构）——**默认扁平**，图片与标注同层：
+#   <名>.jpg|png      原图
+#   <名>.json         茎横截面 + 检查范围 + 根系折线（labelme，三通道一份文件）
+#   <名>.rsml         根系折线（**旧格式**，可选；已并入 json，留着只为回退）
+#
+# 2026-09-30 之前的嵌套布局仍然能读（common/dataset.py 的三个目录函数会自动识别），
+# 下面的常量只在**嵌套**布局下才用得上；扁平布局下它们指向的目录不存在，函数会回退到
+# data_dir 本身。见 common/dataset.py 的模块 docstring。
 IMAGES_SUBDIR = "images"
 ROOTS_LABEL_SUBDIR = "labels/roots"
 ROOTS_LABEL_SUBDIR_ALT = "labels/root"    # 兼容旧命名（单数）

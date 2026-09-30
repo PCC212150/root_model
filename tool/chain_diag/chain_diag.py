@@ -42,8 +42,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import config  # noqa: E402
 from common import ckpt, image_io, naming, predict  # noqa: E402
 from common.dataset import (CH_CHECK, CH_ROOT, CH_STEM, build_target_masks,  # noqa: E402
-                            discover_pairs, find_other)
-from common.rsml_parse import parse_rsml, root_stats  # noqa: E402
+                            discover_pairs, load_annot)
+from common.rsml_parse import root_stats  # noqa: E402
 from common.skeleton_stats import (analyze_mask_anchored,  # noqa: E402
                                    analyze_mask_ex)
 
@@ -51,7 +51,8 @@ from common.skeleton_stats import (analyze_mask_anchored,  # noqa: E402
 def parse_args():
     p = argparse.ArgumentParser(description="把根长/根数误差拆成 测量链路 与 模型")
     p.add_argument("--dir", type=Path, required=True,
-                   help="数据集目录（含 images/ 与 labels/roots/），路径含空格要加引号")
+                   help="数据集目录（扁平布局：图片与标注同层；也认旧的 images/ + labels/），"
+                        "路径含空格要加引号")
     p.add_argument("--model", default=None, help="模型文件夹名（可省 model_ 前缀）；缺省用最新")
     p.add_argument("--size", type=int, default=None,
                    help="模型输入长边；缺省用模型训练时的 --size（自动从权重读）")
@@ -101,7 +102,7 @@ def main():
     if args.limit:
         pairs = pairs[:args.limit]
     if not pairs:
-        sys.exit(f"[错误] {args.dir} 下没有「图片 + rsml」配对数据")
+        sys.exit(f"[错误] {args.dir} 下没有「图片 + 标注」配对数据")
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     model = folder = None
@@ -125,16 +126,15 @@ def main():
 
     rows = []
     t0 = time.time()
-    for i, (name, img_path, rsml_path) in enumerate(pairs, 1):
+    for i, (name, img_path, _annot_path) in enumerate(pairs, 1):
         img = image_io.load_rgb(img_path)
         h0, w0 = img.shape[:2]
-        roots = parse_rsml(rsml_path)
+        annot = load_annot(args.dir, name, (w0, h0))
+        roots = annot.roots
         gt_n, _gt_lens, gt_total = root_stats(roots)
 
         # GT 三通道掩码（原图分辨率；与训练/评测同一实现）
-        gt_masks, _valid = build_target_masks(
-            rsml_path, find_other(args.dir, name), (w0, h0), (w0, h0),
-            args.mask_width)
+        gt_masks, _valid = build_target_masks(annot, (w0, h0), args.mask_width)
         gt_root = np.ascontiguousarray(gt_masks[:, :, CH_ROOT])
         gt_stem = np.ascontiguousarray(gt_masks[:, :, CH_STEM])
         gt_check = np.ascontiguousarray(gt_masks[:, :, CH_CHECK])
