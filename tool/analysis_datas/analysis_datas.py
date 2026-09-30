@@ -404,42 +404,69 @@ def main():
         if len(compare) != 2:
             sys.exit(f"[错误] --compare 要给两种处理方式（如 C,P），当前是 {args.compare!r}")
 
-    for csv_path in csvs:
-        data, st = load_csv(csv_path, args.keep_bad)
+    # ---- 读数据 ----
+    # **对比模式要把多个 CSV 合成一份再比。** 对比找的是「同一份 data 里两种处理方式都有」，
+    # 各读各的话每个 CSV 永远只看得见自己那一个 kind —— 结果是
+    # 「0 个编号两种处理都有 … 已画 0 个编号」：一张图不出，也**不报错**。
+    # 2026-09-30 修（`--csv C_root.csv,P_root.csv --compare C,P` 实际踩到）。
+    if compare:
+        merged, mstats = {}, []
+        for csv_path in csvs:
+            d, st = load_csv(csv_path, args.keep_bad)
+            for key, series in d.items():
+                merged.setdefault(key, {}).update(series)   # 同一 (方式,编号,重复,日期) 冲突时取后者
+            mstats.append((csv_path, st))
+        jobs = [(" vs ".join(p.stem for p, _ in mstats), merged, mstats)]
+    else:
+        jobs = []
+        for csv_path in csvs:
+            d, st = load_csv(csv_path, args.keep_bad)
+            jobs.append((csv_path.stem, d, [(csv_path, st)]))
+
+    for label, data, stats in jobs:
         all_reps = sorted({r for _, _, r in data}, key=lambda x: (len(x), x))
         kinds = sorted({k for k, _, _ in data})
         nums = sorted({n for _, n, _ in data})
         if want:
             nums = [n for n in nums if n in want]
         if not nums:
-            print(f"[跳过] {csv_path.name}: 没有可画的编号\n")
+            print(f"[跳过] {label}: 没有可画的编号\n")
             continue
 
-        out_dir = naming.create_unique_dir(out_root, csv_path.stem)
-        print(f"=== {csv_path.name} → {out_dir.name}/ ===")
-        print(f"  共 {st['总行数']} 行 | 处理方式 {kinds} | 编号 {len(nums)} 个 | 重复 {all_reps}"
-              + (f" | 跳过不可信 {st['跳过不可信']} 行" if st["跳过不可信"] else "")
-              + (f" | 文件名无法解析 {st['文件名无法解析']} 行" if st["文件名无法解析"] else ""))
-        # 非 UTF-8 时明确报出来：多半是 Excel 另存过一次（BOM 丢了、换成 GBK）
-        if st["编码"] != "utf-8-sig":
-            print(f"  [提示] 这个 CSV 是 **{st['编码']}** 编码（不是 inference.py 写的 UTF-8+BOM），"
-                  f"已按 {st['编码']} 读入。多半是用 Excel 打开后另存过 —— 不影响本次读取，"
-                  f"但文件名里的中文若有异常，请核对一下。")
-        if st["无表头"]:
-            print("  [提示] 这个 CSV **没有表头行**，已按 inference.py 的列顺序"
-                  "（图片名/根数量/…/check_ok/root_ok）认列。合并 CSV 时容易丢掉表头 —— "
-                  "不影响本次读取。")
+        out_dir = naming.create_unique_dir(out_root, label)
+        print(f"=== {label} → {out_dir.name}/ ===")
+        n_rows = sum(st["总行数"] for _, st in stats)
+        n_bad = sum(st["跳过不可信"] for _, st in stats)
+        n_un = sum(st["文件名无法解析"] for _, st in stats)
+        print(f"  共 {n_rows} 行 | 处理方式 {kinds} | 编号 {len(nums)} 个 | 重复 {all_reps}"
+              + (f" | 跳过不可信 {n_bad} 行" if n_bad else "")
+              + (f" | 文件名无法解析 {n_un} 行" if n_un else ""))
+        if len(stats) > 1:
+            print("  已合并: " + "、".join(f"{p.name}（{st['总行数']} 行）" for p, st in stats))
+        for csv_path, st in stats:
+            pre = f"  [{csv_path.name}] " if len(stats) > 1 else "  "
+            # 非 UTF-8 时明确报出来：多半是 Excel 另存过一次（BOM 丢了、换成 GBK）
+            if st["编码"] != "utf-8-sig":
+                print(f"{pre}[提示] 这个 CSV 是 **{st['编码']}** 编码"
+                      f"（不是 inference.py 写的 UTF-8+BOM），已按 {st['编码']} 读入。"
+                      f"多半是用 Excel 打开后另存过 —— 不影响本次读取，"
+                      f"但文件名里的中文若有异常，请核对一下。")
+            if st["无表头"]:
+                print(f"{pre}[提示] **没有表头行**，已按 inference.py 的列顺序"
+                      f"（图片名/根数量/…/check_ok/root_ok）认列。合并 CSV 时容易丢掉表头 —— "
+                      f"不影响本次读取。")
+            if st["含空格"]:
+                fn, cl = st["_cleaned"]
+                dst = out_dir / f"{csv_path.stem}_无空格.csv"
+                write_cleaned(fn, cl, dst)
+                print(f"{pre}[清理] {st['含空格']} 个图片名含空格，已按项目约定去掉；"
+                      f"副本 {dst.name}（**原始文件未改动**）")
+            if st["重复点"]:
+                print(f"{pre}[注意] {len(st['重复点'])} 个重复点，已取最后一次："
+                      f"{st['重复点'][:3]}")
         if len(kinds) > 1 and not compare:
             print(f"  {len(kinds)} 种处理方式各画一套；想叠进同一张图对比，用 "
                   f"--compare {','.join(kinds[:2])}")
-        if st["含空格"]:
-            fn, cl = st["_cleaned"]
-            dst = out_dir / f"{csv_path.stem}_无空格.csv"
-            write_cleaned(fn, cl, dst)
-            print(f"  [清理] {st['含空格']} 个图片名含空格，已按项目约定去掉；"
-                  f"副本 {dst.name}（**原始文件未改动**）")
-        if st["重复点"]:
-            print(f"  [注意] {len(st['重复点'])} 个重复点，已取最后一次：{st['重复点'][:3]}")
 
         summary, titles = [], []
         overview = {}          # 总览用：标题 -> 该格子的折线

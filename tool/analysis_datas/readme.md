@@ -17,6 +17,18 @@ CSV 里**同时有 C 和 P 时，每种处理方式各画一套**（`C001_根长
 色盲可辨），所以用**复合编码**：**颜色 = 重复次序**（4 色）、**线型 = 处理方式**（实线/虚线）。
 图例拆成「重复次序」和「处理方式」两块，6 条图例说明 8 条线。
 
+> **`--compare` 会把多个 `--csv` 先合并成一份再比**（2026-09-30 修）。
+> 所以 C、P 分成两个 CSV 时这样用就行：
+>
+> ```
+> python tool\analysis_datas\analysis_datas.py --csv C_root.csv,P_root.csv --compare C,P
+> ```
+>
+> 合并后的输出目录叫 `C_root vs P_root/`，汇总表里会写明合并了哪几个文件。
+> 修之前不是这样：每个 CSV 各自进循环，而对比找的是「同一份数据里两种处理方式都有」，
+> 于是永远只看得见一个 kind —— 打印「0 个编号两种处理都有 … 已画 0 个编号」，
+> **一张图不出也不报错**。踩到就把 C、P 并成一个 CSV 也是当时的绕法。
+
 ## 输入的文件名格式
 
 工具靠文件名分组，所以格式要保住：
@@ -67,6 +79,8 @@ python tool\analysis_datas\analysis_datas.py --csv a.csv,b.csv          # 多个
 python tool\analysis_datas\analysis_datas.py                            # 用 analysis_datas\ 下所有 csv
 python tool\analysis_datas\analysis_datas.py --csv x.csv --ids 001,002       # 只画这几个编号
 python tool\analysis_datas\analysis_datas.py --csv x.csv --compare C,P      # C/P 叠进同一张图
+python tool\analysis_datas\analysis_datas.py --csv C.csv,P.csv --compare C,P --x-cat
+                                                                        # 两个 CSV 会先合并再比
 python tool\analysis_datas\analysis_datas.py --csv x.csv --no-overview      # 不生成总览图
 ```
 
