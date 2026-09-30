@@ -31,8 +31,7 @@
                             文件末尾是若干以 # 开头的汇总行（Excel 可见，脚本可跳过）
     - {图片名}_overlay.png  原图 + 根系(红) + 茎(橙) + 检查范围(绿框)
                             （--overlay-jpg 时为 .jpg，写一张快 47 倍）
-    - {图片名}.rsml         预测根系折线，每条折线一个 plant（不再分主根/侧根）
-    - {图片名}.json         同一批折线的 labelme 版本（与**标注**同格式）
+    - {图片名}.json         预测根系折线（labelme 格式，与**标注**同格式）
     - {图片名}_mask.png     统计口径的根系掩码（**默认不存**，加 --save-mask 才出）
 目录/文件重名时自动追加 -1、-2 …（项目规范）。
 
@@ -40,13 +39,14 @@
 它比根长脆弱得多：根长是骨架长度、几乎不受线宽/阈值影响，而面积随线宽与二值化阈值
 **线性**变化（换个阈值能差一倍）。**适合同一条流水线内做相对比较，不要跨版本比绝对值。**
 
-**逐张输出什么**：默认 `_overlay` + `.rsml` + `.json` 三个文件。
+**逐张输出什么**：默认 `_overlay` + `.json` 两个文件。
 `_stem.png` / `_check.png` 不再输出（overlay 里已用颜色标出），`_mask.png` 需要时加
 `--save-mask`（这几张都是 5472x3648 的大图，省下来是实打实的磁盘和时间）。
 
-两种折线格式是**并存**不是二选一，因为服务的工具不同：`.rsml` 给 RootNav /
-rsml-visualizer 那条老链路，`.json` 给 labelme —— 根系标注 2026-09-30 起就在 labelme json 里，
-同格式才能**把预测和标注叠在一起看**。想只出一种用 `--formats rsml` 或 `--formats json`。
+折线**只出 labelme json**（2026-09-30 起）：根系标注本身就在 labelme json 里，
+同格式才能**把预测和标注叠在一起看**。原来同时出的 `.rsml`（给 RootNav /
+rsml-visualizer 那条老链路）已去掉 —— 那条链路没人用了，多写一份是纯开销；
+`common/rsml_export.py` 仍留着，要恢复只需调一次 `write_rsml`。
 
 > `.json` 里的 `imagePath` 写的是**原图文件名**（不是 overlay），labelme 按它在同级目录找图。
 > 所以要看得建一个同时有图与 json 的临时目录，并把 json **改个名**（如 `<名>_pred.json`）：
@@ -69,7 +69,6 @@ import config  # noqa: E402
 from common import ckpt, image_io, naming, predict  # noqa: E402
 from common.dataset import CH_CHECK, CH_ROOT, CH_STEM  # noqa: E402
 from common.labelme_export import write_labelme_json  # noqa: E402
-from common.rsml_export import write_rsml  # noqa: E402
 from common.skeleton_stats import analyze_mask_anchored  # noqa: E402
 
 
@@ -79,7 +78,6 @@ def parse_argv():
     save_mask = False
     overlay_fmt = "png"
     jobs = 1
-    formats = ("rsml", "json")
     tokens = sys.argv[1:]
     i = 0
     while i < len(tokens):
@@ -87,16 +85,6 @@ def parse_argv():
         if t == "--save-mask":
             save_mask = True
             i += 1
-        elif t == "--formats":
-            # 折线导出格式：rsml（RootNav/rsml-visualizer 那条老链路）、
-            # json（labelme，与标注同格式，能直接叠着看）。默认两种都出。
-            raw = tokens[i + 1] if i + 1 < len(tokens) else ""
-            formats = tuple(x.strip().lower() for x in raw.split(",") if x.strip())
-            bad = [x for x in formats if x not in ("rsml", "json")]
-            if bad:
-                print(f"[错误] --formats 只认 rsml / json，收到 {bad}")
-                sys.exit(1)
-            i += 2
         elif t == "--jobs":
             # 并发处理张数：GPU 前向串行、CPU 部分并行。默认 1（与旧行为一致）
             jobs = int(tokens[i + 1]) if i + 1 < len(tokens) else 1
@@ -136,7 +124,7 @@ def parse_argv():
                 print(f"[错误] 无法识别的参数: {t}")
                 sys.exit(1)
             i += 1
-    return model, folder, mm_per_px, size, save_mask, overlay_fmt, jobs, formats
+    return model, folder, mm_per_px, size, save_mask, overlay_fmt, jobs
 
 
 _BLEND_LUT = {}
@@ -181,8 +169,8 @@ def make_overlay(img: np.ndarray, masks, check_box, alpha: float = 0.45) -> np.n
 
 
 def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
-                gpu_lock, tile=0, formats=("rsml", "json")):
-    """处理一张图：预测 → 统计 → 写 overlay/折线；返回 (CSV 行, 控制台文本)。
+                gpu_lock, tile=0):
+    """处理一张图：预测 → 统计 → 写 overlay/json；返回 (CSV 行, 控制台文本)。
 
     **并发安全**：只有 GPU 那一小段用 gpu_lock 串行 —— 单张图的 GPU 活本来就少
     （模型前向实测 0.33s），串行不拖慢整体，却避免多线程同时抢显存；
@@ -225,7 +213,7 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
                 f"{max(lens) * mm:.1f}" if lens else "0.0"]
 
     # ---- 保存识别结果图片 ----
-    # 默认只出 _overlay（肉眼看结果）+ .rsml（数据）。
+    # 默认只出 _overlay（肉眼看结果）+ .json（数据）。
     # _stem / _check 两张掩码图 2026-09-17 起不再输出：overlay 里已经用颜色标了，
     # _mask 默认也不存（要看统计口径的掩码时加 --save-mask）。
     # 这三张都是 5472x3648 的大图，一张 20MB 上下，省下来是实打实的磁盘和时间。
@@ -246,18 +234,17 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
             out_dir / f"{p.stem}_mask.png", compress_level=1)
 
     # ---- 导出折线 ----
-    # rsml：RootNav / rsml-visualizer 那条老链路（每条折线一个 plant，不分主根/侧根）
-    # json：labelme，与标注同格式 —— 拷到数据集目录里就能和标注并排看
+    # 只出 labelme json（2026-09-30 起）：根系标注本身就在 labelme json 里，
+    # 同格式才能把预测和标注叠在一起看。
+    # 原来还同时出一份 .rsml（RootNav / rsml-visualizer 那条老链路），已去掉 ——
+    # 那条链路现在没人用了，而每次推理多写一份是实打实的开销。
+    # `common/rsml_export.py` 仍留着（无调用点），要恢复只需在这里再调一次 write_rsml。
     saved = [ov_path.name]
-    if "rsml" in formats:
-        write_rsml(out_dir / f"{p.stem}.rsml", file_key=p.stem, polylines=st["paths"])
-        saved.append(".rsml")
-    if "json" in formats:
-        write_labelme_json(out_dir / f"{p.stem}.json",
-                           image_height=img.shape[0], image_width=img.shape[1],
-                           polylines=st["paths"], image_path=p.name,
-                           check_box=res["check_box"] if res["check_ok"] else None)
-        saved.append(".json")
+    write_labelme_json(out_dir / f"{p.stem}.json",
+                       image_height=img.shape[0], image_width=img.shape[1],
+                       polylines=st["paths"], image_path=p.name,
+                       check_box=res["check_box"] if res["check_ok"] else None)
+    saved.append(".json")
     if save_mask:
         saved.append(f"{p.stem}_mask.png")
     return row, (f"{p.name}: 根数 {count} | 总长 {total:.1f} px | 根面积 {root_area} px² | "
@@ -268,8 +255,7 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
 
 
 def main():
-    (model_arg, folder_arg, mm_arg, size_arg, save_mask, overlay_fmt, jobs,
-     formats) = parse_argv()
+    model_arg, folder_arg, mm_arg, size_arg, save_mask, overlay_fmt, jobs = parse_argv()
     if not folder_arg:
         print(__doc__)
         sys.exit(1)
@@ -331,8 +317,8 @@ def main():
         header += ["总根长(mm)", "总根系面积(mm²)", "平均根长(mm)", "最长根(mm)"]
 
     t_start = time.time()
-    # 每张图输出：_overlay + 折线（.rsml / .json，各算一个）+ 可选的 _mask.png
-    n_out = 1 + len(formats) + (1 if save_mask else 0)
+    # 每张图输出：_overlay + .json（折线）+ 可选的 _mask.png
+    n_out = 2 + (1 if save_mask else 0)
 
     # ---- 逐张推理（--jobs >1 时并发；CSV 与打印仍按图片顺序）----
     jobs = max(1, int(jobs))
@@ -341,8 +327,7 @@ def main():
 
     def work(i):
         return process_one(imgs[i], model, size, device, out_dir, mm,
-                           overlay_fmt, save_mask, gpu_lock, tile=tile,
-                           formats=formats)
+                           overlay_fmt, save_mask, gpu_lock, tile=tile)
 
     if jobs == 1:
         for k in range(len(imgs)):
@@ -384,12 +369,11 @@ def main():
     print(f"\n推理完成，总耗时 {el:.1f}s | 平均 {el / len(imgs):.2f}s/张")
     print(f"结果目录: {out_dir}")
     print(f"结果文件: {csv_path}")
-    print(f"已保存文件: 每张图 {n_out} 个（图片名_overlay.{overlay_fmt}"
-          + "".join(f" + .{f}" for f in formats)
+    print(f"已保存文件: 每张图 {n_out} 个（图片名_overlay.{overlay_fmt} + .json"
           + (" + _mask.png" if save_mask else "") + f"），共 {len(imgs) * n_out} 个")
-    if "json" in formats:
-        print("  .json 是 labelme 格式（与标注同格式）：拷到数据集目录里就能和标注并排看；"
-              "里面的 imagePath 记的是原图名，labelme 靠它在同级目录找图。")
+    print("  .json 是 labelme 格式（与标注同格式），能直接叠着看。要看的话另建一个"
+          "同时有原图与 json 的目录，并把 json 改名为 <名>_pred.json —— "
+          "它和标注 json 同名，别拷进 datasets/。")
 
 
 if __name__ == "__main__":

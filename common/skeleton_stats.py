@@ -670,7 +670,8 @@ def extract_root_paths(mask: np.ndarray, spur: float = 30.0, min_len: float = 20
     """返回逐根折线 [[(x, y), ...], ...]（按长度降序，与 analyze_mask 的长度一一对应）。
 
     spacing: 折线点抽稀间距(px)，默认 50，与标注 RSML 的
-    controlpointseparation="50" 一致。可直接喂给 common.rsml_export.write_rsml。
+    controlpointseparation="50" 一致。可直接喂给 common.labelme_export.write_labelme_json
+    （旧格式的 common.rsml_export.write_rsml 也吃同一种输入）。
     """
     return analyze_mask_ex(mask, spur, min_len, erode_iters,
                            with_paths=True, spacing=spacing,

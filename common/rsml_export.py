@@ -1,8 +1,13 @@
-"""把预测出的根系折线导出为与标注同格式的 RSML 文件。
+"""把预测出的根系折线导出为 RSML 文件。
 
-2026-09-14 起本项目不再区分一级/二级根，inference.py 只走「扁平」写法
+⚠️ **本模块目前没有调用点**（2026-09-30 起）。根系标注统一进 labelme json 之后，
+推理侧也改成只出 labelme json（见 common/labelme_export.py），RSML 那条
+（RootNav / rsml-visualizer）不再有人用。保留本模块是为了「要恢复时不至于重写」——
+在 inference.py 里调一次 write_rsml 即可。
+
+2026-09-14 起本项目不再区分一级/二级根，inference.py 当初只走「扁平」写法
 （每条折线一个 plant、全部 primary）。下面的「嵌套」写法（hierarchy=...）与
-check_nested_rsml 保留但已无调用点，仅作历史对照。
+check_nested_rsml 同样保留但已无调用点，仅作历史对照。
 
 两种写法：
 1. **扁平**（不带 hierarchy，向后兼容旧行为）：每条折线 = 一个 plant 下的一条 primary 根；

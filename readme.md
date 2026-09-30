@@ -445,19 +445,19 @@ GT根数 预测根数 GT总长(px) 预测总长(px) 预测各根长(px,分号分
   （见下面「背景底噪兜底」）。**这两列只要出现「否」就该人工看一眼那张图的 overlay。**行尾附 `#` 开头的参数与耗时说明。
 - `{图片名}_overlay.png` —— 原图 + 根系(红) + 茎(橙) + 检查范围(绿框)，一张看完
   （加 `--overlay-jpg` 存成 `.jpg`，写一张快 47 倍、体积小 8 倍，看结果够用）
-- `{图片名}.rsml` —— 预测根系折线，RootNav / rsml-visualizer 那条链路用
-- `{图片名}.json` —— 同一批折线的 **labelme 版本**，与**标注**同格式
+- `{图片名}.json` —— 预测根系折线，**labelme 格式**，与**标注**同格式
 - `{图片名}_mask.png` —— 统计口径的根系掩码（**默认不存**，加 `--save-mask` 才出）
 
 > 2026-09-17 起精简：`_stem.png` / `_check.png` 不再输出（overlay 里已用颜色标出），
 > `_mask.png` 默认不存。每张图少写 3 个 5472×3648 的大 PNG，磁盘和耗时都省一截。
 
-**两种折线格式并存**（2026-09-30 加 `.json`），因为服务的工具不同，不是二选一。
-想只出一种加 `--formats rsml` 或 `--formats json`。`.json` 与标注的键序、
-`imageData: null`、换行都一致（照 labelme 的行为），所以能**把预测和标注叠在一起看**。
+折线**只出 labelme json**（2026-09-30 起）。原来同时出一份 `.rsml` 给 RootNav /
+rsml-visualizer 那条链路，已去掉 —— 那条链路没人用了，每次推理多写一份是纯开销。
+`common/rsml_export.py` 仍留着（无调用点），要恢复只需在 `inference.py` 里调一次 `write_rsml`。
 
-`.json` 里的 `imagePath` 写的是**原图文件名**（不是 overlay），labelme 按它在同级目录找图 ——
-所以要看得建一个同时有图和 json 的临时目录，顺带**改个名**：
+`.json` 与标注的键序、`imageData: null`、换行都一致（照 labelme 的行为），
+所以能**把预测和标注叠在一起看**。里面的 `imagePath` 写的是**原图文件名**（不是 overlay），
+labelme 按它在同级目录找图 —— 所以要看得建一个同时有图和 json 的临时目录，顺带**改个名**：
 
 ```
 copy "datasets\root\test\<图片名>.jpg"        "D:\看我自己的预测\"
@@ -512,8 +512,9 @@ python inference.py --dir "..." --overlay-jpg --jobs 4
 每一次改动都验证过**输出逐位一致**（CSV 数据行 + 输出文件集合）。默认 `--jobs 1`，
 与旧行为一致。内存换吞吐：每张图峰值约 300MB（全分辨率图 + float 合成缓冲），
 jobs 别开太大。
-- `{图片名}.rsml` —— 预测根系折线，**每条折线一个 plant**（不再分主根/侧根），
-  起点已锚定到茎（每条根都从茎发出），可直接用 RootNav / rsml-visualizer 打开，或与标注文件对比
+- `{图片名}.json` —— 预测根系折线，**每条根一段 linestrip**（不再分主根/侧根），
+  起点已锚定到茎（每条根都从茎发出）。labelme 格式，与标注同一套 schema，
+  可**直接与标注文件叠着对比**（用法见上）
 
 ## 统计口径（重要）
 

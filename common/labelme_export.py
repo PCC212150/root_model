@@ -4,9 +4,10 @@
 （`label="root"` + `shape_type="linestrip"`，见 [tool/merge_annot](../tool/merge_annot/readme.md)），
 本模块产出同样的结构，所以 labelme 能直接打开，也能和标注 json 并排比对。
 
-与 `rsml_export.write_rsml` 的关系：**两条输出并存**，不是替代。
-`.rsml` 给 RootNav / rsml-visualizer 那条老链路看，labelme json 给 labelme 看。
-调用方（inference.py）默认两种都写。
+与 `rsml_export.write_rsml` 的关系：**这是替代关系**。根系的两种表示曾同时输出，
+2026-09-30 起只出 labelme json —— 标注全在 labelme json 里了，`.rsml` 那条
+（RootNav / rsml-visualizer）已经没人用，多写一份是纯开销。
+`rsml_export.py` 仍留着（无调用点），要恢复只需在 inference.py 里再调一次。
 
 结构与 labelme 6.x 完全一致（键序、`imageData: null`、`flags: {}` 都照抄），
 所以导出的文件混进标注里不会有任何格式差异。
