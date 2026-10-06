@@ -70,6 +70,38 @@ def binary_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
     return {"iou": iou, "dice": dice, "accuracy": acc}
 
 
+def tolerant_dice(pred: np.ndarray, gt: np.ndarray, tol: int) -> float:
+    """**带容差的 Dice**：预测像素只要落在 GT 的 tol 像素邻域内就算对。
+
+    为什么需要它：细结构（根宽 ~10px，1024 分辨率下只有 1.9 个模型像素）上，裸 Dice
+    基本在量"边界差了几像素"，而不是"这根画得准不准" —— 单根 IoU ≈ (w−δ)/(w+δ)，
+    10px 的根偏 2px 就只剩 0.67。给 tol 像素宽容度后，"几像素的滑移"不再计入，
+    剩下的才是结构性错误（断口、漏根、乱画）。实测（3 张测试图）：
+    裸 Dice 0.55~0.63 → tol=2px 就有 0.70~0.77。
+
+        TP = |pred ∩ dilate(gt, tol)|          预测落在 GT 邻域里 = 对
+        FP = |pred| − TP                       预测落在邻域外 = 多画
+        FN = |gt| − |gt ∩ dilate(pred, tol)|   GT 没被预测邻域盖住 = 漏
+        dice = 2·TP / (2·TP + FP + FN)
+
+    tol=0 时退化成普通 Dice（与 binary_metrics 逐位相同）。
+    实现用 cv2.dilate：20M 像素的图上几十毫秒；scipy 的 binary_dilation 会慢两个量级。
+    """
+    import cv2
+    if pred.shape != gt.shape:
+        raise ValueError(f"形状不一致: {pred.shape} vs {gt.shape}")
+    if tol <= 0:
+        return binary_metrics(pred, gt)["dice"]
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * tol + 1, 2 * tol + 1))
+    p = pred.astype(np.uint8)
+    g = gt.astype(np.uint8)
+    tp = float(cv2.bitwise_and(p, cv2.dilate(g, k)).sum())
+    fp = float(p.sum()) - tp
+    fn = float(g.sum()) - float(cv2.bitwise_and(g, cv2.dilate(p, k)).sum())
+    denom = 2.0 * tp + fp + fn
+    return 2.0 * tp / denom if denom > 0 else 0.0
+
+
 def multi_channel_metrics(preds, gts, names=None, valid=None,
                           cldice_channels=None) -> list:
     """逐通道算指标：preds/gts 为同长度的掩码列表（形状一致）。

@@ -321,22 +321,6 @@ def build_target_masks(annot, target_size, mask_width):
     return masks, valid
 
 
-def build_gt_stem_mask(annot):
-    """只画 **stem 通道**、且**在原图分辨率**上的真值掩码；无茎标注返回 None。
-
-    给「起点锚定」的真值侧用（见 skeleton_stats.anchor_roots_to_stem）：折线的
-    坐标是原图系，所以锚定必须在同一个坐标系里做，不能拿模型分辨率下画的掩码去比。
-
-    比 build_target_masks 便宜得多 —— 它把根系折线也画一遍，那种 5472x3648 的图
-    单是画折线就要好几百毫秒，而这里只画茎的多边形。
-    """
-    if annot is None or annot.lab is None or not annot.lab.stems:
-        return None
-    o = annot.orig_size
-    return gt_mask.draw_polygons_at(
-        [gt_mask.scale_points(p, o, o) for p in annot.lab.stems], o)
-
-
 def _annot_bbox(masks):
     """**根系 / 茎**的并集包围盒 (x0, y0, x1, y1)（右/下开区间）；全空返回 None。
 

@@ -327,94 +327,6 @@ def _strands_of_component(comp_nodes, adj, spur_s, min_len, normalize=True):
     return results
 
 
-def stem_anchor_tolerance(stem_mask, factor: float, min_px: float, max_px: float) -> float:
-    """锚定阈值(px)：与茎的等效半径成正比（泡沫环的厚度跟茎粗细同量级）。
-
-    等效半径 r = sqrt(面积/π)，阈值取 factor*r，卡在 [min_px, max_px] 之间
-    （下限防止小茎时阈值太小锚不上，上限防止茎预测异常时把远处的碎段也拉过来）。
-    """
-    area = float(np.count_nonzero(stem_mask))
-    r_eq = (area / np.pi) ** 0.5 if area > 0 else 0.0
-    return float(min(max_px, max(min_px, factor * r_eq)))
-
-
-def stem_anchor_gain(ends, tree, max_dist: float):
-    """一条折线的两个端点里，离茎最近的那一端需要补多长；超过阈值返回 None。
-
-    ends: [(x, y), (x, y)]，原图坐标（与 analyze_mask_ex 的 paths 同口径）。
-    返回 (补的长度, 该端点的下标, 茎上最近的落点(x, y))。
-    """
-    dists = []
-    for (x, y) in ends:
-        d, idx = tree.query([x, y])
-        dists.append((float(d), idx))
-    k = 0 if dists[0][0] <= dists[1][0] else 1
-    d, idx = dists[k]
-    if d > max_dist:
-        return None
-    sx, sy = tree.data[idx]
-    return d, k, (float(sx), float(sy))
-
-
-def anchor_paths_to_stem(paths, lengths, stem_mask, factor: float = 6.0,
-                         min_px: float = 250.0, max_px: float = 600.0,
-                         metas=None) -> tuple:
-    """把每条折线的起点锚定到茎边界，返回 (新折线, 新长度, 已锚定条数, 新元信息)。
-
-    metas 为 None 时第 4 项也是 None。
-
-    茎外那圈黑色泡沫/海绵环在图像上不是根（模型判成背景是对的），标注却是从茎边开始
-    画的折线 —— 也就是**那一段本来就存在，只是被挡住看不见**。这一步把预测折线的起点
-    沿直线补到茎上，使每条根都从茎发出，长度也计入补回的这一段。
-
-    **注意（2026-09-22 更正）**：这里原来写的是「与标注口径一致」，**那句是错的**。
-    实测真值折线的端点距茎中位 27~490px（跨图差 18 倍），也就是标注起点**并不**在茎边。
-    所以这一步**单边加长了预测**，与真值不同口径 —— 拿它和未锚定的真值比会系统性高估。
-    要两侧可比，真值侧必须走 anchor_roots_to_stem（见下面那个函数）。
-
-    折线会按「起点在茎上」重新定向：锚定的那一端被放到首位，并把茎上的最近点插为首点。
-    两端都离茎超过阈值的折线原样保留（当作独立根计入，不丢信息）。
-    """
-    if stem_mask is None or not stem_mask.any() or not paths:
-        return list(paths), list(lengths), 0, metas
-    from scipy.spatial import cKDTree
-    ys, xs = np.nonzero(stem_mask)
-    tree = cKDTree(np.column_stack([xs, ys]))
-    max_dist = stem_anchor_tolerance(stem_mask, factor, min_px, max_px)
-
-    out_paths, out_lengths, out_metas, n_anchored = [], [], [], 0
-    for i, P in enumerate(paths):
-        is_meta = metas is not None
-        if len(P) < 2:
-            gain = None
-        else:
-            gain = stem_anchor_gain([P[0], P[-1]], tree, max_dist)
-        if gain is None:
-            out_paths.append(P)
-            out_lengths.append(lengths[i])
-            if is_meta:
-                out_metas.append(metas[i])
-            continue
-        d, k, anchor = gain
-        newP = list(P)
-        if k == 0:
-            newP.insert(0, anchor)
-        else:                      # 起点在尾部 -> 整条反转，让起点落在首位
-            newP.append(anchor)
-            newP.reverse()
-        out_paths.append(newP)
-        out_lengths.append(lengths[i] + d)
-        n_anchored += 1
-        if is_meta:
-            m = dict(metas[i])
-            if k == 1:
-                m["start_kind"], m["end_kind"] = m.get("end_kind"), m.get("start_kind")
-                m["start_node"], m["end_node"] = m.get("end_node"), m.get("start_node")
-            m["anchored"] = True
-            out_metas.append(m)
-    return out_paths, out_lengths, n_anchored, (out_metas if metas is not None else None)
-
-
 def continuation_flags(roots, max_gap: float = 150.0, max_angle: float = 30.0) -> list:
     """标记哪些 RSML 折线是「上一条的续接」（**交叉处断开重画**留下的碎片）。
 
@@ -428,8 +340,11 @@ def continuation_flags(roots, max_gap: float = 150.0, max_angle: float = 30.0) -
 
     **阈值是启发式的、没有干净解**：实测缺口距离分布是 20~400px 连续、无双峰
     （中位 111px），因为缺口宽度 = 压在上面那根根的宽度 + 标注时的随手留白，跨图不一样。
-    所以这个函数**只用来抑制锚定**（宁可漏锚，也不要给中段凭空加几百像素），
-    不要拿它当「根数」的口径用 —— 根数在这份数据上不可靠，见 tool/chain_diag/readme.md。
+    所以这个函数只作**标注质量诊断**（test.py 的「其中续接片段」列，判断该图根数可不可信）
+    用，不要拿它当「根数」的口径用 —— 根数在这份数据上不可靠，见 tool/chain_diag/readme.md。
+
+    2026-10-05：本函数原还用于抑制「真值侧锚定」的中段碎片，起点锚定已整体删除，
+    抑制逻辑随之消失（见 config.py 的历史注记），函数本体保留给上面的诊断用途。
     """
     n = len(roots)
     flags = [False] * n
@@ -457,52 +372,6 @@ def continuation_flags(roots, max_gap: float = 150.0, max_angle: float = 30.0) -
                 flags[i] = True
                 break
     return flags
-
-
-def anchor_roots_to_stem(roots, stem_mask, factor: float = 6.0,
-                         min_px: float = 250.0, max_px: float = 600.0,
-                         max_gap: float = 150.0, max_angle: float = 30.0) -> tuple:
-    """把 **RSML 真值折线**按「起点锚定到茎」的口径补长，返回 (总长, 锚定条数)。
-
-    **当前 `test.py` 走的是另一条路线**（真值掩码 → analyze_mask_anchored），因为
-    那条路与预测侧是**逐字同一个函数**，口径不可能漂。本函数是**折线路线**的备选实现，
-    保留用于交叉校验：两条路线在 11 张测试图上给出 +8.9%（折线）vs +7.5%（掩码），
-    差 1.4 个百分点，互相印证。**要改锚定口径时，两条都跑一遍看是否仍然一致。**
-
-
-    为什么真值也要锚：实测（2026-09-22，tool/chain_diag）证明
-
-        GT 折线端点距茎中位 27~490px（跨图差 18 倍），锚定却用固定阈值
-        clamp(6×r_eq, 250, 600)=600px —— 也就是**标注起点并不在茎边**。
-        于是同一条流水线跑真值掩码 vs 模型掩码，真值 −3.4%、模型 +7.5%，
-        差的这 10.9 个百分点全是锚定，不是模型。
-
-    所以「用锚定」这个决定要求**两侧同口径**：预测补的那段，真值也得补。
-    不补的话任何误差数字都混了口径差。
-
-    走的是与预测侧**同一个** anchor_paths_to_stem，只是输入换成 RSML 折线，
-    所以两边不会漂。roots 只要有 .points 与 .length 即可（鸭子类型）。
-
-    **续接片段不锚**（见 continuation_flags）：标注在交叉处断开重画，中段碎片的起点
-    在交叉点而不是茎上，把它们也锚过去等于凭空加几百像素。实测不抑制的话
-    plant_ S068-4_20251126ST 会被推到 +88%（21228 → 39925），抑制后回到合理量级。
-    """
-    lengths = [float(r.length) for r in roots]
-    if stem_mask is None or not stem_mask.any() or not roots:
-        return float(sum(lengths)), 0
-    cont = continuation_flags(roots, max_gap=max_gap, max_angle=max_angle)
-    paths, keep, skipped = [], [], 0.0
-    for r, c, L in zip(roots, cont, lengths):
-        if c:                     # 续接片段：原样计入，不锚
-            skipped += L
-            continue
-        paths.append(list(r.points))
-        keep.append(L)
-    if not paths:
-        return float(sum(lengths)), 0
-    _, out_lengths, n, _ = anchor_paths_to_stem(
-        paths, keep, stem_mask, factor=factor, min_px=min_px, max_px=max_px)
-    return float(sum(out_lengths)) + skipped, n
 
 
 def _decimate(pts, spacing):
@@ -618,43 +487,6 @@ def analyze_mask_ex(mask: np.ndarray, spur: float = 30.0, min_len: float = 20.0,
         # 每条折线的端点类型（叶端 / 分叉点）：侧根 = 起点在分叉点、终点在叶端且不长的折线
         out["strand_meta"] = [t[2] for t in entries]
     return out
-
-
-def analyze_mask_anchored(mask, stem_mask=None, spur: float = 30.0,
-                          min_len: float = 20.0, erode_iters: int = 1,
-                          spacing: float = 50.0, normalize_count: bool = True,
-                          factor: float = 6.0, min_px: float = 250.0,
-                          max_px: float = 600.0) -> dict:
-    """analyze_mask_ex + 「起点锚定到茎」：统计量全部是锚定后的口径。
-
-    给 stem_mask 时，每条折线的起点会被补到茎边界并计入长度（见 anchor_paths_to_stem）。
-    返回的字典与 analyze_mask_ex 同构，另加 "anchored_count"（锚定成功的条数）。
-    """
-    st = analyze_mask_ex(mask, spur=spur, min_len=min_len, erode_iters=erode_iters,
-                         with_paths=True, spacing=spacing,
-                         normalize_count=normalize_count)
-    st["anchored_count"] = 0
-    if stem_mask is None or not st["paths"]:
-        return st
-    paths, lengths, n, metas = anchor_paths_to_stem(
-        st["paths"], st["lengths"], stem_mask,
-        factor=factor, min_px=min_px, max_px=max_px,
-        metas=st.get("strand_meta"))
-    st["paths"], st["lengths"] = paths, lengths
-    st["total"] = float(sum(lengths))
-    st["strand_meta"] = metas
-    st["anchored_count"] = n
-    return st
-
-
-def anchor_gain_for_trace(trace, tree, max_dist: float) -> float:
-    """给「像素轨迹」(skeleton_stats 内部的 (y, x) 口径) 算需要补的锚定长度。
-
-    参数扫描（tool/tune_stats）复用邻接表时用，保证扫描口径与部署一致。
-    """
-    ends = [(trace[0][1], trace[0][0]), (trace[-1][1], trace[-1][0])]
-    g = stem_anchor_gain(ends, tree, max_dist)
-    return g[0] if g is not None else 0.0
 
 
 def analyze_mask(mask: np.ndarray, spur: float = 30.0, min_len: float = 20.0,

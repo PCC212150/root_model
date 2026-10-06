@@ -61,10 +61,17 @@ COL_NAME = "图片名"
 
 # inference.py 写出来的列顺序。**没有表头的 CSV 按这个补名** ——
 # 合并多个 CSV、或用 Excel 另存时，表头很容易丢掉，而列顺序一直是这个。
-DEFAULT_COLUMNS = ["图片名", "根数量", "起点锚定(条)", "总根长(px)", "总根系面积(px²)",
+# 2026-10-05 起 inference.py 删掉了「起点锚定(条)」列（锚定整体删除）；更早的无表头
+# 旧文件带着这一列，按位置认列会从第 3 列起整体错位，所以留一份历史列序，
+# 按**首行列数**挑表：新 11/15 列（无/有 mm），旧 12/16 列（多第 3 列「起点锚定(条)」）。
+DEFAULT_COLUMNS = ["图片名", "根数量", "总根长(px)", "总根系面积(px²)",
                    "平均根长(px)", "最长根(px)", "各根长度(px)", "茎面积(px²)",
                    "检查区面积(px²)", "check_ok", "root_ok",
                    "总根长(mm)", "总根系面积(mm²)", "平均根长(mm)", "最长根(mm)"]
+LEGACY_COLUMNS = ["图片名", "根数量", "起点锚定(条)", "总根长(px)", "总根系面积(px²)",
+                  "平均根长(px)", "最长根(px)", "各根长度(px)", "茎面积(px²)",
+                  "检查区面积(px²)", "check_ok", "root_ok",
+                  "总根长(mm)", "总根系面积(mm²)", "平均根长(mm)", "最长根(mm)"]
 # 两个纵坐标指标：(内部键, 图里显示名, 纵轴标题, CSV 列名, 数值格式)
 METRICS = (
     ("len", "根长", "总根长 (px)", "总根长(px)", "{:.1f}"),
@@ -152,17 +159,27 @@ def load_csv(path: Path, keep_bad: bool):
                 if r and any(c.strip() for c in r)]
     if not raw_rows:
         raise SystemExit(f"[错误] {path.name} 是空的（或只有空行）")
+    legacy_order = False
     if COL_NAME in raw_rows[0]:
         fieldnames, body = raw_rows[0], raw_rows[1:]
         no_header = False
     else:
         # **没有表头**：合并多个 CSV、或 Excel 另存，都很容易把表头丢掉。
         # 按 inference.py 的列顺序补一个；列数对不上时 zip 自动截断，取值不受影响。
-        fieldnames, body, no_header = DEFAULT_COLUMNS, raw_rows, True
+        # 列数决定用新表还是历史表（历史表第 3 列是「起点锚定(条)」，见上面注释）。
+        ncols = len(raw_rows[0])
+        if ncols in (11, 15):
+            fieldnames = DEFAULT_COLUMNS[:ncols] if ncols == 11 else DEFAULT_COLUMNS
+        elif ncols in (12, 16):
+            fieldnames, legacy_order = LEGACY_COLUMNS[:ncols], True
+        else:                      # 列数不认识：退回默认表，zip 截断
+            fieldnames = DEFAULT_COLUMNS
+        body, no_header = raw_rows, True
     rows = [dict(zip(fieldnames, r)) for r in body]
     data = defaultdict(lambda: defaultdict(dict))
     st = {"总行数": 0, "跳过不可信": 0, "文件名无法解析": 0, "数值无法解析": 0,
-          "重复点": [], "含空格": 0, "编码": enc, "无表头": no_header}
+          "重复点": [], "含空格": 0, "编码": enc, "无表头": no_header,
+          "旧列序": legacy_order}
     cleaned = []
     for r in rows:
         st["总行数"] += 1
@@ -452,9 +469,14 @@ def main():
                       f"多半是用 Excel 打开后另存过 —— 不影响本次读取，"
                       f"但文件名里的中文若有异常，请核对一下。")
             if st["无表头"]:
-                print(f"{pre}[提示] **没有表头行**，已按 inference.py 的列顺序"
-                      f"（图片名/根数量/…/check_ok/root_ok）认列。合并 CSV 时容易丢掉表头 —— "
-                      f"不影响本次读取。")
+                if st["旧列序"]:
+                    print(f"{pre}[提示] **没有表头行**，且列数是旧版的（含「起点锚定(条)」，"
+                          f"2026-10-05 前 inference.py 写的）—— 已按历史列顺序认列，"
+                          f"锚定那一列读入但不使用；总根长等数值本身仍是那时的锚定口径。")
+                else:
+                    print(f"{pre}[提示] **没有表头行**，已按 inference.py 的列顺序"
+                          f"（图片名/根数量/…/check_ok/root_ok）认列。合并 CSV 时容易丢掉表头 —— "
+                          f"不影响本次读取。")
             if st["含空格"]:
                 fn, cl = st["_cleaned"]
                 dst = out_dir / f"{csv_path.stem}_无空格.csv"

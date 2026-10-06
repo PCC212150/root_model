@@ -139,7 +139,8 @@ def tiled_probs(model, img: np.ndarray, tile: int, overlap: int = 256,
     为什么需要它：U-Net 是全卷积的，但显存限制单次前向能吃的尺寸（tool/mem_probe
     实测 5472x3648 要 40GB，24G 卡塞不进）。而「把整图缩到 2048」会改变尺度 —— 模型
     学的是**原始分辨率下的根宽（10px）**，缩到 0.374 倍只剩 3.7px，实测茎通道会直接
-    塌成 0（那是总长系统性偏短的直接来源：锚定依赖茎）。
+    塌成 0（当年「锚定依赖茎」，塌茎会连带总长系统性偏短；锚定已于 2026-10-05 删除，
+    但茎塌本身仍必须避免 —— 它是要交付的输出通道）。
 
     **拼接必须在概率层做，不能二值后再拼**：二值图在块边界各自截断，一条根会被切成
     几段 —— 而断/并正是本项目根数与总长误差的主要来源。
@@ -293,8 +294,9 @@ def predict(model, img: np.ndarray, max_side: int, stride: int = 16,
 
     # ---- 其余通道：普通 0.5 阈值（茎/检查范围是块状目标，不需要滞回） ----
     # 只算**真的有人用**的通道：全分辨率二值化一张要 ~100ms。逐处查过调用方 ——
-    # inference / test / tune_stats 都只用 CH_STEM，check 用的是模型分辨率上算出来的
-    # check_box，那个全分辨率掩码全项目没人读。传 None 占位，保住 masks 的下标语义。
+    # 锚定删除（2026-10-05）后只剩 inference 读 CH_STEM（茎面积列 + overlay 橙层）；
+    # check 用的是模型分辨率上算出来的 check_box，那个全分辨率掩码全项目没人读。
+    # 传 None 占位，保住 masks 的下标语义。
     masks = [None] * n_ch
     masks[CH_ROOT] = mask_counted
     for c in full_channels:

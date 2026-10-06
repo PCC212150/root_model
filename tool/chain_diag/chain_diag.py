@@ -6,9 +6,9 @@
 
     A  参考       RSML 折线的欧氏长度（根数 = 折线条数）—— 唯一的真值口径
     B0 纯链路     GT 折线按 MASK_LINE_WIDTH 画成掩码 -> 骨架 -> 分链，
-                  **不剪枝、不过滤、不归一、不做 ROI/锚定**
+                  **不剪枝、不过滤、不归一、不做 ROI**
                   A→B0 的差 = 「画粗再骨架化」本身损失掉的长度
-    B1 完美模型   GT 掩码 ∩ GT 检查框 -> 骨架 -> 分链 -> 起点锚定到 GT 茎，
+    B1 完美模型   GT 掩码 ∩ GT 检查框 -> 骨架 -> 分链 -> 剪枝，
                   完全按部署口径。**这是整个系统在「掩码完美」时的上限**
     C  当前系统   模型预测 -> 与 B1 同一套部署口径
 
@@ -17,6 +17,10 @@
     B1/A-1    系统上限 —— 模型完美时还剩多少误差
     C/A-1     当前实际
     C-B1      模型的真实贡献（这才是「换模型/加分辨率/改损失」能动的部分）
+
+2026-10-05：起点锚定已整体删除（见 config.py 的历史注记）。本工具 readme 里
+「锚定单独 +10.9 个百分点」的结论是删除前（含锚定口径）的测量，保留作依据；
+现在的 B1/C 都不再含锚定，与那张历史表不可直接比。
 
 如果 B1 的误差远小于 C，说明**瓶颈在模型**，继续调链路是白费；
 如果 B1 自己就偏很多，那**先修链路**，否则后面所有改进都在给错尺子调刻度。
@@ -41,11 +45,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
 from common import ckpt, image_io, naming, predict  # noqa: E402
-from common.dataset import (CH_CHECK, CH_ROOT, CH_STEM, build_target_masks,  # noqa: E402
+from common.dataset import (CH_CHECK, CH_ROOT, build_target_masks,  # noqa: E402
                             discover_pairs, load_annot)
 from common.rsml_parse import root_stats  # noqa: E402
-from common.skeleton_stats import (analyze_mask_anchored,  # noqa: E402
-                                   analyze_mask_ex)
+from common.skeleton_stats import analyze_mask_ex  # noqa: E402
 
 
 def parse_args():
@@ -77,22 +80,16 @@ def _rel(v, base):
     return (v / base - 1.0) * 100.0 if base else float("nan")
 
 
-def _chain(mask, stem_mask, spur, min_len, anchor):
-    """按部署口径跑一遍「掩码 -> 骨架 -> 分链 -> (锚定)」，返回 (根数, 总长)。
+def _chain(mask, spur, min_len):
+    """按部署口径跑一遍「掩码 -> 骨架 -> 分链」，返回 (根数, 总长)。
 
-    anchor=False 时不锚定（B0 用）；anchor=True 时要求 stem_mask 给出来。
-    两者都走 common.skeleton_stats 的同一实现，与 test.py / inference.py 无异。
+    走 common.skeleton_stats 的同一实现，与 test.py / inference.py 无异
+    （起点锚定已于 2026-10-05 整体删除，这里也不再含它）。
     """
     if mask is None or not mask.any():
         return 0, 0.0
-    if anchor and stem_mask is not None and stem_mask.any():
-        st = analyze_mask_anchored(
-            mask, stem_mask, spur=spur, min_len=min_len,
-            factor=config.STEM_ANCHOR_FACTOR, min_px=config.STEM_ANCHOR_MIN_PX,
-            max_px=config.STEM_ANCHOR_MAX_PX)
-    else:
-        st = analyze_mask_ex(mask, spur=spur, min_len=min_len, with_paths=False,
-                             normalize_count=True)
+    st = analyze_mask_ex(mask, spur=spur, min_len=min_len, with_paths=False,
+                         normalize_count=True)
     return st["count"], float(st["total"])
 
 
@@ -136,14 +133,12 @@ def main():
         # GT 三通道掩码（原图分辨率；与训练/评测同一实现）
         gt_masks, _valid = build_target_masks(annot, (w0, h0), args.mask_width)
         gt_root = np.ascontiguousarray(gt_masks[:, :, CH_ROOT])
-        gt_stem = np.ascontiguousarray(gt_masks[:, :, CH_STEM])
         gt_check = np.ascontiguousarray(gt_masks[:, :, CH_CHECK])
 
-        # B0：纯链路 —— 不剪枝、不过滤、不归一、无 ROI、无锚定
-        b0_n, b0_total = _chain(gt_root, None, 0.0, 0.0, anchor=False)
-        # B1：完美模型 —— GT 根 ∩ GT 检查框，锚定到 GT 茎，部署口径
-        b1_n, b1_total = _chain(gt_root & gt_check, gt_stem,
-                                args.spur, args.min_len, anchor=True)
+        # B0：纯链路 —— 不剪枝、不过滤、不归一、无 ROI
+        b0_n, b0_total = _chain(gt_root, 0.0, 0.0)
+        # B1：完美模型 —— GT 根 ∩ GT 检查框，走部署的剪枝/最短根口径
+        b1_n, b1_total = _chain(gt_root & gt_check, args.spur, args.min_len)
 
         if args.no_model:
             c_n, c_total = 0, float("nan")
@@ -151,8 +146,7 @@ def main():
             res = predict.predict(model, img, max_side=size, stride=config.STRIDE,
                                   device=device,
                                   low_thresh=config.PRED_LOW_THRESHOLD)
-            c_n, c_total = _chain(res["mask_counted"], res["masks"][CH_STEM],
-                                  args.spur, args.min_len, anchor=True)
+            c_n, c_total = _chain(res["mask_counted"], args.spur, args.min_len)
 
         e0, e1, ec = _rel(b0_total, gt_total), _rel(b1_total, gt_total), \
             _rel(c_total, gt_total)
@@ -208,8 +202,8 @@ def main():
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
         fh.write(f"# 误差分解（测量链路 vs 模型）  数据: {args.dir}  "
                  f"模型: {folder.name if folder else '未用（--no-model）'}\n")
-        fh.write(f"# A 参考=RSML折线欧氏长度 | B0 纯链路=GT掩码不剪枝不锚定 | "
-                 f"B1 完美模型=GT掩码走部署口径 | C 当前系统=模型预测走部署口径\n")
+        fh.write(f"# A 参考=RSML折线欧氏长度 | B0 纯链路=GT掩码不剪枝 | "
+                 f"B1 完美模型=GT掩码走部署的剪枝口径 | C 当前系统=模型预测走同一口径\n")
         fh.write(f"# 线宽 {args.mask_width:g}px | B1/C 剪枝 {args.spur:g}px "
                  f"最短根 {args.min_len:g}px | 输入长边 "
                  f"{size if folder else '—'}\n")

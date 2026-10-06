@@ -12,7 +12,7 @@
 结构与 labelme 6.x 完全一致（键序、`imageData: null`、`flags: {}` 都照抄），
 所以导出的文件混进标注里不会有任何格式差异。
 
-**坐标系**：折线一律是**原图坐标**（`skeleton_stats.analyze_mask_anchored` 的 `paths`
+**坐标系**：折线一律是**原图坐标**（`skeleton_stats.analyze_mask_ex` 的 `paths`
 就是原图系），与标注同一个坐标系，不需要任何换算。
 
 **怎么在 labelme 里打开**：json 里的 `imagePath` 写的是**原图文件名**（不是 overlay），

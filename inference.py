@@ -17,14 +17,13 @@
 
 统计口径：
   - 根系只在**模型识别出的检查范围**内统计（范围外不计入），不扣茎；
-  - 每条预测折线的**起点会锚定到茎边界**——茎外那圈黑色泡沫环不是根（模型判背景没错），
-    但标注是从茎边开始画的，那一段被挡住、实际存在，所以补回来并计入根长。
-    这一步只在「标注从茎边画」的口径下成立，当前数据集正是这种；
-    若换成「只画看得见的根」的数据集，锚定会让总长系统性偏高，需要重新评估。
+  - 折线就是「掩码 → 骨架 → 分链」的直接输出，**不做起点锚定**
+    （锚定曾把远离茎的碎段也沿直线接到茎上，2026-10-05 整体删除，见 config.py
+    的历史注记；那之前的总长数字与现在不可比）。
 
 结果：result/{目标文件夹名}/
     - {目标文件夹名}.csv    每行一张图（UTF-8 BOM，Excel 直接双击可开）：
-                            图片名 根数量 起点锚定(条) 总根长(px) 总根系面积(px²)
+                            图片名 根数量 总根长(px) 总根系面积(px²)
                             平均根长(px) 最长根(px) 各根长度(px) 茎面积(px²)
                             检查区面积(px²) check_ok root_ok
                             「各根长度」用分号分隔；--mm-per-px>0 时追加 mm 列；
@@ -69,7 +68,7 @@ import config  # noqa: E402
 from common import ckpt, image_io, naming, predict  # noqa: E402
 from common.dataset import CH_CHECK, CH_ROOT, CH_STEM  # noqa: E402
 from common.labelme_export import write_labelme_json  # noqa: E402
-from common.skeleton_stats import analyze_mask_anchored  # noqa: E402
+from common.skeleton_stats import analyze_mask_ex  # noqa: E402
 
 
 def parse_argv():
@@ -184,12 +183,12 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
         res = predict.predict(model, img, max_side=size, stride=config.STRIDE,
                               device=device, tile=tile)
     masks = res["masks"]
-    # 起点锚定到茎：补回被泡沫环挡住的那一段（计入根长，与标注同口径）
-    st = analyze_mask_anchored(
-        res["mask_counted"], masks[CH_STEM] if len(masks) > CH_STEM else None,
+    # 折线/统计 = 「掩码 → 骨架 → 分链」的直接输出，不做起点锚定
+    # （2026-10-05 整体删除，见 config.py 的历史注记）
+    st = analyze_mask_ex(
+        res["mask_counted"],
         spur=config.PRED_SPUR_LENGTH, min_len=config.MIN_ROOT_LENGTH,
-        factor=config.STEM_ANCHOR_FACTOR, min_px=config.STEM_ANCHOR_MIN_PX,
-        max_px=config.STEM_ANCHOR_MAX_PX)
+        with_paths=True)
     count, lens, total = st["count"], st["lengths"], st["total"]
     len_str = ";".join(f"{v:.1f}" for v in lens) if lens else "-"
     # 总根系面积 = 统计口径的根系掩码像素数（已限定在检查范围内），单位 px²。
@@ -201,7 +200,7 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
     check_area = (int((res["check_box"][2] - res["check_box"][0])
                       * (res["check_box"][3] - res["check_box"][1]))
                   if res["check_ok"] else img.shape[0] * img.shape[1])
-    row = [p.name, count, st["anchored_count"], f"{total:.1f}",
+    row = [p.name, count, f"{total:.1f}",
            root_area,
            f"{total / count:.1f}" if count else "0.0",
            f"{max(lens):.1f}" if lens else "0.0", len_str,
@@ -249,8 +248,7 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
         saved.append(f"{p.stem}_mask.png")
     return row, (f"{p.name}: 根数 {count} | 总长 {total:.1f} px | 根面积 {root_area} px² | "
                  f"各根长 {len_str[:60]}{'…' if len(len_str) > 60 else ''}\n"
-                 f"    检查范围 {'已识别' if res['check_ok'] else '未识别(全图统计)'} | "
-                 f"起点已锚定到茎 {st['anchored_count']}/{count} 条 | 已保存: "
+                 f"    检查范围 {'已识别' if res['check_ok'] else '未识别(全图统计)'} | 已保存: "
                  + " + ".join(saved))
 
 
@@ -310,7 +308,7 @@ def main():
     csv_path = out_dir / f"{img_dir.name}.csv"
     mm = mm_per_px if mm_per_px and mm_per_px > 0 else 0.0
 
-    header = ["图片名", "根数量", "起点锚定(条)", "总根长(px)", "总根系面积(px²)",
+    header = ["图片名", "根数量", "总根长(px)", "总根系面积(px²)",
               "平均根长(px)", "最长根(px)", "各根长度(px)", "茎面积(px²)",
               "检查区面积(px²)", "check_ok", "root_ok"]
     if mm:
@@ -351,8 +349,6 @@ def main():
         wr.writerow(header)
         wr.writerows(rows_out)
         f.write(f"# 根系统计范围：模型识别出的检查范围（check_background），范围外不计入\n")
-        f.write(f"# 起点锚定：每条预测折线的起点已补到茎边界，补回的那一段计入根长"
-                f"（与标注口径一致）；「起点锚定(条)」是成功锚定的条数\n")
         f.write(f"# 单位：px（像素）；" + (f"mm 列按 1 px = {mm} mm 换算\n"
                                         if mm else "未做 mm 换算（--mm-per-px 关闭）\n"))
         f.write("# 总根系面积 = 统计口径的根系掩码像素数（已限定在检查范围内）。"
@@ -360,9 +356,7 @@ def main():
                 "（换个阈值能差一倍）—— 适合同一条流水线内相对比较，别跨版本比绝对值\n")
         f.write(f"# 参数：模型 {' + '.join(names)}，输入长边 {size}，"
                 f"低阈值 {config.PRED_LOW_THRESHOLD}，剪枝 {config.PRED_SPUR_LENGTH}px，"
-                f"最短根 {config.MIN_ROOT_LENGTH}px，"
-                f"锚定阈值 {config.STEM_ANCHOR_FACTOR}×茎半径"
-                f"（{config.STEM_ANCHOR_MIN_PX:.0f}~{config.STEM_ANCHOR_MAX_PX:.0f}px）\n")
+                f"最短根 {config.MIN_ROOT_LENGTH}px\n")
         f.write(f"# 共 {len(imgs)} 张图，推理耗时 {time.time() - t_start:.1f}s\n")
 
     el = time.time() - t_start

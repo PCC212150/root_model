@@ -17,6 +17,8 @@
 根总数/总长来自 [common/skeleton_stats.py](../../common/skeleton_stats.py)，掩码本身是
 「根系概率 ∩ 模型识别出的检查范围」（沿用 `predict.predict` 的同一条流水线），
 所以这里扫出来的最优参数就是部署时实际生效的参数。
+**2026-10-05 起「起点锚定」整体删除**，原来扫的 `anchor_min`/`anchor_max` 两维已去掉；
+那之前扫出的「总长」数字含锚定口径，与现在不可比。
 
 ## 运行环境
 
@@ -63,8 +65,6 @@ python tool\tune_stats\tune_stats.py --dir datasets\root\test --gt-mask
 | `--min-len` | 否 | `20` | 最短根长候选(px) |
 | `--erode` | 否 | `1` | 腐蚀次数候选 |
 | `--normalize-count` | 否 | `both` | `on` / `off` / `both`（两种口径都扫） |
-| `--anchor-min` | 否 | `config.STEM_ANCHOR_MIN_PX` | 锚定阈值下限候选(px，原图尺度) |
-| `--anchor-max` | 否 | `config.STEM_ANCHOR_MAX_PX` | 锚定阈值上限候选(px，原图尺度)。**实测这个才是真正生效的那个** |
 | `--limit` | 否 | 0=全部 | 只跑前 N 张（按文件名排序） |
 | `--gt-mask` | 否 | 关 | 用真值掩码代替模型输出（上限实验，不需模型） |
 | `--size` | 否 | `config.MAX_SIDE` | 模型输入长边像素 |
@@ -109,7 +109,10 @@ txt 示例（列省略）：
 # 耗时: 总 210.5s | 单图 8.77s | 组合平均 2.338s
 ```
 
-## 锚定那一维：`STEM_ANCHOR_FACTOR` 实际是失效的（2026-09-19）
+## 锚定那一维（历史，2026-10-05 该维度已随锚定一起删除）
+
+结论保留备查：`STEM_ANCHOR_FACTOR` 实际是失效的（2026-09-19 实测），
+原值 600 就是最优，无需调整。下面那张表来自含锚定的口径，与现在的扫描不可比。
 
 锚定阈值 = `clamp(FACTOR × 茎等效半径, anchor_min, anchor_max)`，而
 **本数据集茎的等效半径约 215~252px（原图尺度）**（实测 S068-4 145467px 面积 → r_eq 215.2；

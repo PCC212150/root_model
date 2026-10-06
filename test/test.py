@@ -5,8 +5,10 @@
     python test/test.py --model model_202609091135
     python test/test.py --model_202609091135              # 兼容写法
 
-输出：三类通道（根系 / 茎横截面 / 检查范围）各自的 IoU / Dice / 像素准确率，
-以及每张图「预测根数/总长 vs RSML 真值」的对比与平均绝对误差。
+输出：三类通道（根系 / 茎横截面 / 检查范围）各自的 IoU / Dice / 像素准确率 / clDice /
+连通块，根系另加两个补充口径（**容差 Dice**：几像素的边界滑移不算错；**滞回口径 Dice**：
+部署统计总长实际用的那张掩码），以及每张图「预测根数/总长 vs RSML 真值」的对比与
+平均绝对误差。口径细节见 common/metrics.py 与 CSV 末尾的 # 行。
 结果保存至模型文件夹内 model_test_{年月日时分}.csv（UTF-8 BOM，Excel 可直接打开；
 文件末尾是若干以 # 开头的汇总行）。
 """
@@ -27,7 +29,7 @@ from common import ckpt, image_io, metrics, naming, predict  # noqa: E402
 from common.dataset import (CH_CHECK, CH_ROOT, CH_STEM,  # noqa: E402
                             build_target_masks, discover_pairs, load_annot)
 from common.rsml_parse import root_stats  # noqa: E402
-from common.skeleton_stats import (analyze_mask_anchored,  # noqa: E402
+from common.skeleton_stats import (analyze_mask_ex,  # noqa: E402
                                    continuation_flags)
 
 # 要算 clDice / 连通块数的通道：**只给细结构**。检查范围是块状区域、骨架没有意义，
@@ -60,12 +62,22 @@ def parse_args():
     p.add_argument("--out-dir", type=Path, default=config.MODEL_DIR)
     p.add_argument("--mm-per-px", type=float, default=None,
                    help="长度换算：1 像素 = 多少毫米（默认用 config.MM_PER_PX）")
+    p.add_argument("--mask-width", type=float, default=None,
+                   help="评测时把真值折线画成多宽(px，原图尺度)；默认 config.MASK_LINE_WIDTH。"
+                        "**换尺子实验用**：同一份预测换线宽 Dice 会差很多（5px→10px 实测 "
+                        "0.50→0.62），要比两个模型就得用同一个值，别拿不同线宽的 Dice 互比")
     p.add_argument("--cpu", action="store_true")
     return p.parse_args(preprocess_argv())
 
 
 def main():
     args = parse_args()
+    # 评测尺子：真值折线画多宽。**换线宽 = 换尺子** —— 同一份预测 5px→10px 实测
+    # Dice 0.50→0.62，所以不同线宽下的 Dice/IoU 一律不可互比（见 --mask-width 说明）。
+    mask_width = args.mask_width or config.MASK_LINE_WIDTH
+    if mask_width != config.MASK_LINE_WIDTH:
+        print(f"[尺子] 真值线宽 {mask_width:g}px（config 是 {config.MASK_LINE_WIDTH:g}px）"
+              f" —— 与其它线宽下的指标不可比")
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available()
                           else "cuda")
     # --model 支持逗号分隔的多个模型（集成），见 ckpt.resolve_pths
@@ -103,7 +115,8 @@ def main():
     names = list(config.CLASS_NAMES)
     rows = []
     agg = {k: [] for k in ("gt_roots", "pred_roots", "gt_total", "gt_total_raw",
-                           "pred_total", "gt_cont")}
+                           "pred_total", "gt_cont",
+                           "root_tol2", "root_tol4", "root_hyst")}
     per_ch_metrics = {n: {"iou": [], "dice": [], "accuracy": [], "cldice": [],
                           "ncomp": []} for n in names}
     t_start = time.time()
@@ -131,24 +144,24 @@ def main():
         # 2026-09-25 改正 —— 代价是**与训练日志里的 val Dice 不再同一口径**
         # （那个按模型分辨率算，用于追一条曲线的趋势）；跨模型比较必须用这个。
         w1, h1 = w0, h0
-        gt_masks, valid = build_target_masks(annot, (w1, h1), config.MASK_LINE_WIDTH)
+        gt_masks, valid = build_target_masks(annot, (w1, h1), mask_width)
         # ---- 「理想掩码」对照：真值掩码走**与预测逐字相同**的那条流水线 ----
-        # 为什么需要它：预测总长 = 「掩码 → 骨架 → 分链 → 起点锚定」的输出，而这条
-        # 流水线本身不是恒等的（实测 骨架化 −1.9% / 剪枝 −3.4% / 锚定 +10.9 个百分点，
-        # 见 tool/chain_diag）。直接拿预测总长比 RSML 折线长，混着口径差；比这条流水线
-        # 在**掩码完美**时的输出，剩下的才是模型真正的贡献。
+        # 为什么需要它：预测总长 = 「掩码 → 骨架 → 分链」的输出，而这条流水线本身
+        # 不是恒等的（实测 骨架化 −1.9% / 剪枝 −3.4%，见 tool/chain_diag）。直接拿
+        # 预测总长比 RSML 折线长，混着口径差；比这条流水线在**掩码完美**时的输出，
+        # 剩下的才是模型真正的贡献。
         # 所以主指标是「预测 vs 理想」，副指标是「理想 vs 标注」（= 流水线固有偏差）。
-        gt_masks_orig, _ = build_target_masks(annot, (w0, h0), config.MASK_LINE_WIDTH)
+        # 注：上面几个历史数字是 2026-09-22 在含起点锚定的口径下测的，锚定已于
+        # 2026-10-05 整体删除（见 config.py），那之后的总长数字与以前不可比。
+        gt_masks_orig, _ = build_target_masks(annot, (w0, h0), mask_width)
         gt_orig_root = np.ascontiguousarray(gt_masks_orig[:, :, CH_ROOT])
         if valid[CH_CHECK] > 0:      # 与预测同口径：只在检查范围内统计
             gt_orig_root = gt_orig_root & np.ascontiguousarray(
                 gt_masks_orig[:, :, CH_CHECK])
-        gt_ideal = analyze_mask_anchored(
-            gt_orig_root, np.ascontiguousarray(gt_masks_orig[:, :, CH_STEM]),
-            spur=config.PRED_SPUR_LENGTH, min_len=config.MIN_ROOT_LENGTH,
-            factor=config.STEM_ANCHOR_FACTOR, min_px=config.STEM_ANCHOR_MIN_PX,
-            max_px=config.STEM_ANCHOR_MAX_PX)
-        gt_total, gt_anchored = gt_ideal["total"], gt_ideal["anchored_count"]
+        gt_ideal = analyze_mask_ex(
+            gt_orig_root,
+            spur=config.PRED_SPUR_LENGTH, min_len=config.MIN_ROOT_LENGTH)
+        gt_total = gt_ideal["total"]
         gt = [np.ascontiguousarray(gt_masks[:, :, c]) for c in range(gt_masks.shape[2])]
         # 不变式：GT 根系也应限定在 GT 检查范围内（当前标注 100% 在框内，属校验性质）
         if valid[CH_CHECK] > 0:
@@ -162,18 +175,26 @@ def main():
                 image_io.resize_bool_mask(pb, w0, h0)
 
         preds = [_to_orig(res["probs"][c] > 0.5) for c in range(len(res["probs"]))]
-        # 与部署同口径：起点锚定到茎（补回被泡沫环挡住的那一段，计入根长）
-        st = analyze_mask_anchored(
-            res["mask_counted"], res["masks"][CH_STEM],
-            spur=config.PRED_SPUR_LENGTH, min_len=config.MIN_ROOT_LENGTH,
-            factor=config.STEM_ANCHOR_FACTOR, min_px=config.STEM_ANCHOR_MIN_PX,
-            max_px=config.STEM_ANCHOR_MAX_PX)
+        # 与部署同口径：「掩码 → 骨架 → 分链」的直接输出，不做起点锚定
+        st = analyze_mask_ex(
+            res["mask_counted"],
+            spur=config.PRED_SPUR_LENGTH, min_len=config.MIN_ROOT_LENGTH)
         pred_cnt, pred_lens, pred_total = st["count"], st["lengths"], st["total"]
 
         # clDice / 连通块数只算**细结构**通道：检查范围是块状区域，骨架没有意义，
         # 而且骨架化在 5472x3648 上要 0.3s/张，白花。
         ms = metrics.multi_channel_metrics(preds, gt, names=names, valid=valid,
                                            cldice_channels=CLDICE_CH)
+        # root 的两个补充口径（只在 root 通道上算，见 metrics.tolerant_dice 与 CSV 页脚）：
+        #   ① 容差 Dice：几像素的边界滑移不算错，剩下的才是断口/漏根这类结构性错误；
+        #   ② 滞回口径 Dice：部署统计总长实际用的 mask_counted（低阈值 + 检查范围求交），
+        #      它与上面那个 0.5 阈值的 Dice 不是同一张图。
+        dice_tol2 = metrics.tolerant_dice(preds[CH_ROOT], gt[CH_ROOT], 2)
+        dice_tol4 = metrics.tolerant_dice(preds[CH_ROOT], gt[CH_ROOT], 4)
+        dice_hyst = metrics.binary_metrics(res["mask_counted"], gt[CH_ROOT])["dice"]
+        agg["root_tol2"].append(dice_tol2)
+        agg["root_tol4"].append(dice_tol4)
+        agg["root_hyst"].append(dice_hyst)
         for m in ms:
             for k in ("iou", "dice", "accuracy", "cldice", "ncomp"):
                 per_ch_metrics[m["name"]][k].append(m[k])
@@ -190,10 +211,11 @@ def main():
         for m in ms:
             row += [_f(m["iou"]), _f(m["dice"]), _f(m["accuracy"]),
                     _f(m["cldice"]), _f(m["ncomp"], "{:.0f}")]
-        row += [gt_count, n_cont, pred_cnt, st["anchored_count"], gt_anchored,
+        row += [gt_count, n_cont, pred_cnt,
                 f"{gt_total_raw:.1f}", f"{gt_total:.1f}", f"{pred_total:.1f}", len_str]
         if mm and mm > 0:
             row += [f"{gt_total * mm:.1f}", f"{pred_total * mm:.1f}"]
+        row += [f"{dice_tol2:.4f}", f"{dice_tol4:.4f}", f"{dice_hyst:.4f}"]
         rows.append(row)
 
         parts = []
@@ -209,8 +231,7 @@ def main():
             parts.append(s)
         desc = " | ".join(parts)
         print(f"[{name}] {desc} | 根数 GT {gt_count}(含续接 {n_cont})/预测 {pred_cnt}"
-              f" | 锚定 GT {gt_anchored} 条 / 预测 {st['anchored_count']} 条 | "
-              f"总长 GT {gt_total_raw:.0f}→理想 {gt_total:.0f} | 预测 {pred_total:.0f}")
+              f" | 总长 GT {gt_total_raw:.0f}→理想 {gt_total:.0f} | 预测 {pred_total:.0f}")
 
     el = time.time() - t_start
 
@@ -224,11 +245,12 @@ def main():
     for n in names:
         header += [f"IoU({n})", f"Dice({n})", f"像素准确率({n})",
                    f"clDice({n})", f"连通块({n})"]
-    header += ["GT根数(ID数)", "其中续接片段", "预测根数", "预测锚定(条)", "GT锚定(条)",
+    header += ["GT根数(ID数)", "其中续接片段", "预测根数",
                "GT总长-标注(px)", "GT总长-理想(px)", "预测总长(px)",
                "预测各根长(px,降序,至多30条)"]
     if mm and mm > 0:
         header += ["GT总长(mm)", "预测总长(mm)"]
+    header += ["Dice(root)@2px容差", "Dice(root)@4px容差", "Dice(root)滞回口径"]
 
     summary = [
         "",
@@ -243,7 +265,7 @@ def main():
         f"#   对照①「标注原始总长」平均 {avg('gt_total_raw'):.0f} px —— "
         f"理想(掩码走同一条流水线) 比它高 "
         f"{(avg('gt_total') / max(avg('gt_total_raw'), 1) - 1) * 100:+.1f}%，"
-        f"这部分是**流水线固有偏差**（骨架化/剪枝/锚定），换模型不会变；",
+        f"这部分是**流水线固有偏差**（骨架化/剪枝），换模型不会变；",
         f"#   对照②主指标用「预测 vs 理想」而不是「预测 vs 标注」，就是为了把这部分剔掉，"
         f"剩下的才是模型的贡献。",
     ]
@@ -284,14 +306,19 @@ def main():
         "# 只对细结构通道（根系 / 茎）算 —— 检查范围是块状区域，骨架没有意义。",
     ]
     summary += [
-        f"# 统计口径：输入长边 {size}；根系只在模型识别出的检查范围内统计，"
-        f"且真值与预测**都走同一条流水线**（掩码→骨架→分链→起点锚定）；"
-        f"两侧同口径是 2026-09-22 起的改动 —— 在那之前只给预测锚定、真值用原始折线，"
-        f"单边高估约 10.9 个百分点（见 config.py 的 STEM_ANCHOR_* 与 tool/chain_diag/）；"
-        f"低阈值 {config.PRED_LOW_THRESHOLD} / 剪枝 {config.PRED_SPUR_LENGTH}px / "
-        f"最短根 {config.MIN_ROOT_LENGTH}px / "
-        f"锚定 {config.STEM_ANCHOR_FACTOR}×茎半径"
-        f"({config.STEM_ANCHOR_MIN_PX:.0f}~{config.STEM_ANCHOR_MAX_PX:.0f}px)",
+        f"# 统计口径：输入长边 {size}；**真值线宽 {mask_width:g}px**（像素指标的尺子，"
+        f"换线宽不可比）；根系只在模型识别出的检查范围内统计，且真值与预测**都走同一条"
+        f"流水线**（掩码→骨架→分链）；低阈值 {config.PRED_LOW_THRESHOLD} / "
+        f"剪枝 {config.PRED_SPUR_LENGTH}px / 最短根 {config.MIN_ROOT_LENGTH}px",
+        f"# 2026-10-05 起「起点锚定」已整体删除（见 config.py 的历史注记）——"
+        f"此前的总长/总长MAE 与今后不可比，锚定当年单独贡献约 +10.9 个百分点"
+        f"（见 tool/chain_diag/）",
+        f"# root 补充口径：容差 Dice @2px {avg('root_tol2'):.4f} / @4px {avg('root_tol4'):.4f}"
+        f" —— 预测落在 GT 的 k px 邻域内就算对（几像素的边界滑移不算错），"
+        f"剩下的才是断口/漏根这类结构性错误；",
+        f"#   部署（滞回）口径 Dice {avg('root_hyst'):.4f} —— 统计总长用的那张 mask_counted"
+        f"（低阈值 {config.PRED_LOW_THRESHOLD} + 检查范围求交），比上面 0.5 阈值那张胖，"
+        f"两张不是同一张图；",
         f"# 单位换算：1 px = {mm} mm" if mm else "# 未做 mm 换算",
         f"# 测试总耗时 {el:.1f}s | 单图平均 {el / max(len(pairs), 1):.2f}s",
     ]
