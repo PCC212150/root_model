@@ -80,7 +80,7 @@ class Dist:
         self.backend = None
 
     # ---- 初始化 / 收尾 ----
-    def init(self, verbose=True):
+    def init(self, verbose=True, need_gb: float = None):
         """建进程组。返回本 rank 该用的 torch.device。"""
         import torch
         import torch.distributed as dist
@@ -112,8 +112,22 @@ class Dist:
         if cuda:
             torch.cuda.set_device(self.local_rank)
         if verbose:
+            # **DDP 下没有"自动挑卡"这回事**：每个 rank 绑死一张，挑不了。
+            # 而分到哪张取决于 `CUDA_VISIBLE_DEVICES`（不设就是 0,1,2,...）——
+            # 正好切到别人占着的卡上时，报一句"这张卡剩多少"比让它 OOM 好查得多。
+            mem = ""
+            if cuda:
+                try:
+                    free, total = torch.cuda.mem_get_info(self.local_rank)
+                    mem = f" | 显存空闲 {free / 2**30:.1f}/{total / 2**30:.1f} GB"
+                    if need_gb is not None and free / 2**30 < need_gb:
+                        mem += (f"  ← **低于需要的 {need_gb:.1f} GB**："
+                                f"这张卡上多半有别的任务，换个组合重来"
+                                f"（用 CUDA_VISIBLE_DEVICES 挑）")
+                except Exception:
+                    pass
             print(f"[DDP] rank {self.rank}/{self.world}（本机第 {self.local_rank} 张卡）"
-                  f" | 后端 {self.backend} | 设备 {dev}", flush=True)
+                  f" | 后端 {self.backend} | 设备 {dev}{mem}", flush=True)
         # **非 rank0 的 stdout 静音**：项目里到处是 print（数据加载、警告、提示），
         # 4 个进程会各打一份、在控制台上交错成一片。只留 rank0 的。
         # **stderr 不动** —— 别的 rank 崩了，traceback 照样看得见。

@@ -283,7 +283,7 @@ def main():
     ddp = device_mod.Dist(cpu=args.cpu)
     if ddp.enabled:
         # 多卡时**不能用自动挑卡**：每张卡固定绑一个 rank，挑了也没用
-        device = ddp.init()
+        device = ddp.init(need_gb=NEED_GB)
     else:
         # 自动挑当前最空的 GPU（不再写死 cuda:0 —— 服务器上 4 张卡常有人占着）
         device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None),
