@@ -42,7 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
-from common import ckpt, image_io, naming, predict  # noqa: E402
+from common import device as device_mod, ckpt, image_io, naming, predict  # noqa: E402
 from PIL import Image  # noqa: E402
 
 PROGRESS_EVERY = 10      # 每处理这么多张报一次进度
@@ -69,6 +69,9 @@ def parse_args(argv=None):
                    help="模型输入长边；默认用模型训练时的设置（从权重里读）")
     p.add_argument("--dry-run", action="store_true",
                    help="只识别检查范围并打印，不写任何图片")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="用哪张 GPU（默认自动挑当前最空的一张）；等价于环境变量 ROOT_MODEL_GPU")
+
     p.add_argument("--cpu", action="store_true", help="强制用 CPU")
     return p.parse_args(argv)
 
@@ -91,8 +94,7 @@ def main():
         sys.exit(f"[错误] 图片文件夹不存在: {img_dir}")
 
     import torch
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available()
-                          else "cuda")
+    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None))
     pths, names = ckpt.resolve_pths(args.model)
     model, metas = ckpt.load_models(pths, device)
     meta = metas[0]

@@ -44,7 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
-from common import ckpt, image_io, naming, predict  # noqa: E402
+from common import device as device_mod, ckpt, image_io, naming, predict  # noqa: E402
 from common.dataset import (CH_CHECK, CH_ROOT, build_target_masks,  # noqa: E402
                             discover_pairs, load_annot)
 from common.rsml_parse import root_stats  # noqa: E402
@@ -71,6 +71,9 @@ def parse_args():
                    help="不算 C（不加载模型），只量 A / B0 / B1 三条链路")
     p.add_argument("--out", type=Path, default=config.RESULT_DIR / "chain_diag",
                    help="结果目录（重名自动加 -1）")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="用哪张 GPU（默认自动挑当前最空的一张）；等价于环境变量 ROOT_MODEL_GPU")
+
     p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 
@@ -101,7 +104,7 @@ def main():
     if not pairs:
         sys.exit(f"[错误] {args.dir} 下没有「图片 + 标注」配对数据")
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None))
     model = folder = None
     size = args.size or config.MAX_SIDE
     if not args.no_model:

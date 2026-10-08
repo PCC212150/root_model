@@ -24,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
+from common import device as device_mod  # noqa: E402
 from common.unet import UNet  # noqa: E402
 
 N_CH = len(config.CLASS_NAMES)
@@ -45,6 +46,9 @@ def parse_args():
     p.add_argument("--infer", action="store_true",
                    help="只测**推理**（torch.inference_mode，无优化器/无反向）。"
                         "训练峰值和推理峰值差很多 —— 后者没有为反向保存的激活。")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="用哪张 GPU（默认自动挑当前最空的一张）；等价于环境变量 ROOT_MODEL_GPU")
+
     p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 
@@ -133,7 +137,7 @@ def main():
     batches = [int(v) for v in args.batch.split(",") if v.strip()]
     amp = not args.no_amp
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None))
     if device.type == "cuda":
         name = torch.cuda.get_device_name(device)
         total = torch.cuda.get_device_properties(device).total_memory / MIB

@@ -78,7 +78,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
-from common import ckpt, image_io, naming, predict  # noqa: E402
+from common import ckpt, device as device_mod, image_io, naming, predict  # noqa: E402
 from common.dataset import CH_CHECK, CH_ROOT, CH_STEM  # noqa: E402
 from common.labelme_export import write_labelme_json  # noqa: E402
 from common.skeleton_stats import analyze_mask_ex  # noqa: E402
@@ -346,7 +346,9 @@ def main():
     pths, names = ckpt.resolve_pths(model_arg)
 
     import torch
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 自动挑当前最空的 GPU（不再写死 cuda:0 —— 服务器上 4 张卡常有人占着）
+    device = device_mod.pick(cpu=getattr(args, "cpu", False),
+                             gpu=getattr(args, "gpu", None))
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
     meta = metas[0]
     # 切片训练的模型走**原始分辨率滑窗**（见 ckpt.infer_tile 的实测对比）；0 = 老路径

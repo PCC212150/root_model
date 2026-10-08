@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
-from common import naming  # noqa: E402
+from common import device as device_mod, naming  # noqa: E402
 from common.dataset import RootDataset, plant_key  # noqa: E402
 from common.unet import UNet  # noqa: E402
 
@@ -144,6 +144,11 @@ def _accumulate(pb, gt, vd, d_all, i_all):
     i_all.append(is_)
 
 
+# 训练大概要多少显存（低于这个值就告警）。1024/batch2 实测 4.4GB；
+# 1536/batch4 在 24G 卡上约 10~12GB。这里给个下限，不够时由 device.pick 告警。
+NEED_GB = 4.5
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="训练甘蔗根系 U-Net（三通道多标签）")
     p.add_argument("--size", type=int, default=config.MAX_SIDE, help="输入长边像素")
@@ -184,6 +189,9 @@ def parse_args():
                    help="DataLoader 子进程数（0=主进程里同步加载）。服务器上设 4~8 可让"
                         "读图/增强与训练并行，避免 GPU 空等（默认见 config.NUM_WORKERS）")
     p.add_argument("--no-amp", action="store_true", help="关闭混合精度")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="指定用哪张 GPU（默认自动挑当前最空的一张）；"
+                        "也可以用环境变量 ROOT_MODEL_GPU")
     p.add_argument("--cpu", action="store_true", help="强制使用 CPU")
     return p.parse_args()
 
@@ -243,13 +251,11 @@ def main():
             sys.exit(f"[错误] --pos-weight 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
                      f"当前 {len(pos_weight)} 个: {args.pos_weight}")
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available()
-                          else "cuda")
+    # 自动挑当前最空的 GPU（不再写死 cuda:0 —— 服务器上 4 张卡常有人占着）
+    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None),
+                             need_gb=NEED_GB)
     if device.type == "cpu":
         print("[警告] 使用 CPU 训练，速度很慢。pcc 环境支持 CUDA（RTX 5060）。")
-    else:
-        print(f"GPU: {torch.cuda.get_device_name(0)}  显存: "
-              f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} GB")
 
     # ---- 数据划分：按植株整组进出（保证可复现） ----
     names = [n for n, _, _ in _pairs(args.data_dir)]

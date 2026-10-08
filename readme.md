@@ -141,10 +141,26 @@ python tool\separate_dataset\separate_dataset.py --dir "<源文件夹>" --out "%
 - 依赖已装好：torch 2.12.1+cu130 / torchvision / numpy / pillow / scikit-image（见 [requirements.txt](requirements.txt)）；
   写 CSV 用的是标准库 `csv`，**没有新增依赖**
 - 本机 GPU：RTX 5060 Laptop 8G（默认按此配置：长边 1024、batch 2、BatchNorm，见下）
-- 若部署到服务器（两张 RTX3090，各 24G）：可提高分辨率与 batch，无需改代码 ——
+- 若部署到服务器（**4 张 RTX3090，各 24G**）：可提高分辨率与 batch，无需改代码 ——
   `python train/train.py --size 1536 --batch 4 --workers 8`
-  （**只会用其中一张卡**：项目里没有 DataParallel/DDP，`export CUDA_VISIBLE_DEVICES=0,1`
-  也不能让它用上第二张，见 [config.py](config.py) 的说明）
+
+### 用哪张卡：自动挑最空的那张（2026-10-08）
+
+`common/device.py` 在启动时列一遍**可见**的卡、挑**当前空闲显存最多**的那张，并把每张卡的
+占用情况打进日志：
+
+```
+可见 GPU：cuda:0 RTX 3090 空闲 24.0/24.0GB 占用率 0%；cuda:1 RTX 3090 空闲 1.9/24.0GB ...
+[选卡] 自动选 cuda:0（空闲 24.0 GB，4 张卡里最空的一张）
+```
+
+- 显式指定：`--gpu 2`（train/test/inference 与各工具都接）或 `export ROOT_MODEL_GPU=2`
+- 都不够用（都低于 4.5GB）→ 仍然挑最空的，但**大声告警**，让 OOM 自己报出来
+- 没有 CUDA / `--cpu` → CPU
+- ⚠️ **同时起两个训练时两边都要显式 `--gpu`**：否则两个进程启动时看到的是同一份空闲显存，
+  会挑到同一张卡上
+- 历史：在这之前 device 写的是 `torch.device("cuda")`（= 永远 cuda:0），服务器上只要
+  0 号被别人占着就直接 OOM（实测 1 号卡被一个 Java 进程占了 22.5G）
 
 ## 使用说明
 

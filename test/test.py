@@ -26,7 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
-from common import ckpt, image_io, metrics, naming, predict  # noqa: E402
+from common import device as device_mod, ckpt, image_io, metrics, naming, predict  # noqa: E402
 from common.dataset import (CH_CHECK, CH_ROOT, CH_STEM,  # noqa: E402
                             build_target_masks, discover_pairs, load_annot)
 from common.rsml_parse import root_stats  # noqa: E402
@@ -67,6 +67,9 @@ def parse_args():
                    help="评测时把真值折线画成多宽(px，原图尺度)；默认 config.MASK_LINE_WIDTH。"
                         "**换尺子实验用**：同一份预测换线宽 Dice 会差很多（5px→10px 实测 "
                         "0.50→0.62），要比两个模型就得用同一个值，别拿不同线宽的 Dice 互比")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="用哪张 GPU（默认自动挑当前最空的一张）；等价于环境变量 ROOT_MODEL_GPU")
+
     p.add_argument("--cpu", action="store_true")
     return p.parse_args(preprocess_argv())
 
@@ -79,8 +82,7 @@ def main():
     if mask_width != config.MASK_LINE_WIDTH:
         print(f"[尺子] 真值线宽 {mask_width:g}px（config 是 {config.MASK_LINE_WIDTH:g}px）"
               f" —— 与其它线宽下的指标不可比")
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available()
-                          else "cuda")
+    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None))
     # --model 支持逗号分隔的多个模型（集成），见 ckpt.resolve_pths
     pths, names = ckpt.resolve_pths(args.model, args.out_dir)
     pth = pths[0]

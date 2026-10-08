@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config  # noqa: E402
-from common import ckpt, image_io, naming, predict  # noqa: E402
+from common import device as device_mod, ckpt, image_io, naming, predict  # noqa: E402
 from common.dataset import discover_pairs, load_annot  # noqa: E402
 from common.gt_mask import draw_mask_from_roots  # noqa: E402
 from common.image_io import prob_to_orig_mask, prob_to_orig_mask_hysteresis  # noqa: E402
@@ -81,6 +81,9 @@ def parse_args():
     p.add_argument("--out", type=Path, default=config.RESULT_DIR / "tune_stats",
                    help="结果目录（重名自动加 -1）")
     p.add_argument("--dry-run", action="store_true", help="只打印组合数与预计耗时，不推理不写文件")
+    p.add_argument("--gpu", type=int, default=None,
+                   help="用哪张 GPU（默认自动挑当前最空的一张）；等价于环境变量 ROOT_MODEL_GPU")
+
     p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 
@@ -144,7 +147,7 @@ def main():
         print("[dry-run] 未推理、未写文件。去掉 --dry-run 即正式运行。")
         return
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None))
     model = folder = None
     size = args.size or config.MAX_SIDE
     if not args.gt_mask:

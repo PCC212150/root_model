@@ -288,12 +288,17 @@ BATCH_SIZE = 2            # BatchNorm 需要 batch≥2；本机 8G 在 1024 下 
 # 表现为「显存占满但 nvidia-smi 的 GPU-Util 接近 0」，白白浪费卡。
 NUM_WORKERS = 0
 
-# 注意（本文件 2026-09-15 修正）：本机/服务器上都**只会用一张卡**。
-# train.py 里 device 是 torch.device("cuda")，等价于 cuda:0；全项目没有任何
-# DataParallel / DistributedDataParallel 代码，所以 export CUDA_VISIBLE_DEVICES=0,1
-# 并不会让它用上第二张卡 —— 那只是把两张卡都「暴露」出来，cuda:0 仍然只映射到其中一张。
-# 想真正用两张卡得改成 DDP（要 torchrun 启动），而本项目的瓶颈是数据量（18 张训练图），
-# 不是算力，多卡不会让模型变好；要物尽其用就让第二张卡去跑别的任务（标注/另一个配置）。
+# 注意：**一次训练只用一张卡**，但用哪张是**自动挑的**（见 common/device.py，2026-10-08）。
+# 全项目没有任何 DataParallel / DistributedDataParallel 代码 —— 本项目的瓶颈是数据量
+# （几十张训练图）不是算力，多卡不会让模型变好；要物尽其用就让别的卡去跑别的任务。
+#
+# 早先 device 写的是 `torch.device("cuda")`（= 永远 cuda:0），服务器上 4 张 3090 里
+# 只要 0 号被别人占着就会 OOM。现在启动时按**当前空闲显存**挑最空的一张：
+#     python train\train.py                 # 自动挑
+#     python train\train.py --gpu 2         # 指定（或 export ROOT_MODEL_GPU=2）
+# 每张卡的占用情况会打在日志开头（事后能知道当时跑的是哪张）。
+# ⚠️ 同时起两个训练时**两边都要显式 --gpu**：否则两个进程启动时看到的是同一份空闲显存，
+#    会挑到同一张卡上。
 ACCUM = 1                 # 梯度累积：显存不够又想要更大等效 batch 时用（注意不能救 BatchNorm
                           # 的 batch=1 问题）
 EPOCHS = 5000             # 只是轮数上限。现在是 ReduceLROnPlateau，不再拿它当退火周期
