@@ -37,7 +37,11 @@ def parse_args():
                    help="要实测的**长边**像素，逗号分隔（宽高比按数据集原图 5472x3648）")
     p.add_argument("--orig", default="5472x3648", help="数据集原图尺寸 WxH（决定宽高比）")
     p.add_argument("--batch", default="1", help="batch 大小，逗号分隔")
-    p.add_argument("--norm", default="group", choices=("group", "batch"))
+    # **默认跟 config.NORM 走**（现在是 batch）。原来写死 group —— 而 GroupNorm 的显存
+    # 正好是 BatchNorm 的 2 倍（实测 1536/batch2：group 18.60 GB vs batch 9.3 GB），
+    # 默认值跟训练配置不一致的话，探出来的数字会把人吓得不敢用。
+    p.add_argument("--norm", default=config.NORM, choices=("group", "batch"),
+                   help=f"归一化类型，默认跟 config.NORM 一致（当前 {config.NORM}）")
     p.add_argument("--base", type=int, default=64, help="U-Net 首层通道数")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--checkpoint", action="store_true",
