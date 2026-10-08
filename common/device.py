@@ -57,6 +57,103 @@ def describe(devs=None) -> str:
     return "；".join(parts)
 
 
+class Dist:
+    """DDP 上下文：**没走 torchrun 时 world=1、rank=0，所有分支退化成单卡单进程**。
+
+    于是 train.py 里只有一条训练循环，单卡和多卡共用 —— 不需要维护两份代码。
+
+    单卡：`python train/train.py --batch 8`
+    多卡：`torchrun --nproc_per_node=4 train/train.py --batch 2`
+          （--batch 是**每张卡**的；4 卡 × 2 = 等效 batch 8）
+
+    判据是 `LOCAL_RANK` 这个环境变量：torchrun 一定会设它，手工 `python xxx.py` 一定没有。
+    不用 RANK/WORLD_SIZE —— 那两个变量用户自己也常设，会误判。
+    """
+
+    def __init__(self, cpu: bool = False):
+        import os
+        self.enabled = "LOCAL_RANK" in os.environ
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world = int(os.environ.get("WORLD_SIZE", 1))
+        self._cpu = cpu
+        self.backend = None
+
+    # ---- 初始化 / 收尾 ----
+    def init(self, verbose=True):
+        """建进程组。返回本 rank 该用的 torch.device。"""
+        import torch
+        import torch.distributed as dist
+        if not self.enabled:
+            return None
+        if not dist.is_available():
+            raise SystemExit("[错误] 这个 torch 没有编译分布式支持，跑不了 DDP")
+        cuda = torch.cuda.is_available() and not self._cpu
+        if cuda and dist.is_nccl_available():
+            self.backend = "nccl"
+        elif cuda:
+            # Windows 上 torch 没有编译 NCCL（NCCL 是 Linux 专有的），只剩 gloo；
+            # 而 gloo **不支持 CUDA 张量**的集合通信 —— 硬跑会在第一次 all-reduce 时
+            # 报一句很难懂的 "No backend type associated with device type cuda"。
+            # 与其让人对着那句报错查半天，不如在这里说清楚。
+            raise SystemExit(
+                "[错误] 这个平台没有 NCCL（Windows 就是），多卡 DDP 跑不了 GPU。\n"
+                "       正式的多卡训练请在 Linux 上跑；"
+                "本机想验证逻辑可以加 --cpu（gloo + CPU，慢但流程一样）。")
+        else:
+            self.backend = "gloo"
+        # init_method 默认 env://（torchrun 的标准做法）。留个口子给
+        # `file://` —— 有些环境（Windows 上这个 torch 就没编 libuv、TCPStore 建不起来）
+        # 用不了 TCP 集合点，file:// 不碰它，本地也能跑 2 个 rank 做验证。
+        init_method = os.environ.get("ROOT_MODEL_DDP_INIT", "env://")
+        dist.init_process_group(self.backend, init_method=init_method,
+                                rank=self.rank, world_size=self.world)
+        dev = torch.device(f"cuda:{self.local_rank}" if cuda else "cpu")
+        if cuda:
+            torch.cuda.set_device(self.local_rank)
+        if verbose:
+            print(f"[DDP] rank {self.rank}/{self.world}（本机第 {self.local_rank} 张卡）"
+                  f" | 后端 {self.backend} | 设备 {dev}", flush=True)
+        # **非 rank0 的 stdout 静音**：项目里到处是 print（数据加载、警告、提示），
+        # 4 个进程会各打一份、在控制台上交错成一片。只留 rank0 的。
+        # **stderr 不动** —— 别的 rank 崩了，traceback 照样看得见。
+        if self.rank != 0:
+            import sys as _sys
+            _sys.stdout.flush()
+            _sys.stdout = open(os.devnull, "w")
+        return dev
+
+    def close(self):
+        import torch.distributed as dist
+        if self.enabled and dist.is_initialized():
+            dist.destroy_process_group()
+
+    # ---- 集合通信 ----
+    def allreduce_sum(self, tensor):
+        import torch.distributed as dist
+        if self.enabled:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
+
+    def broadcast_object(self, obj, src=0):
+        if not self.enabled:
+            return obj
+        import torch.distributed as dist
+        box = [obj]
+        dist.broadcast_object_list(box, src=src)
+        return box[0]
+
+    def barrier(self):
+        import torch.distributed as dist
+        if self.enabled:
+            dist.barrier()
+
+    @property
+    def is_main(self):
+        """只有 rank 0 打印/写文件/存权重 —— 否则 4 张卡会往同一个日志里写四份。"""
+        return self.rank == 0
+
+
 def pick(cpu: bool = False, gpu=None, need_gb: float = None, verbose: bool = True):
     """返回 torch.device。gpu 为整数 = 显式指定那张；None = 自动挑最空的。"""
     import torch

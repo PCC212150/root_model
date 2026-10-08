@@ -162,6 +162,39 @@ python tool\separate_dataset\separate_dataset.py --dir "<源文件夹>" --out "%
 - 历史：在这之前 device 写的是 `torch.device("cuda")`（= 永远 cuda:0），服务器上只要
   0 号被别人占着就直接 OOM（实测 1 号卡被一个 Java 进程占了 22.5G）
 
+### 多卡训练（DDP，2026-10-08）
+
+```bash
+torchrun --nproc_per_node=4 train/train.py --size 1536 --batch 2 --workers 2
+```
+
+**`--batch` 是每张卡的**：上面这条 = 4 张卡各吃 2 张图 = 等效 batch 8
+（日志第一行会写 `batch 2×4卡=8`，别拿它跟单卡 batch 8 的旧数字直接比）。
+直接 `python train/train.py` 就是原来的单卡单进程 —— **同一份训练循环，没有第二套代码**。
+
+| 项 | 行为 |
+| --- | --- |
+| 判据 | 只看环境变量 `LOCAL_RANK`（torchrun 一定设、手工跑一定没有），不看 `RANK`/`WORLD_SIZE`（用户自己也会设，会误判） |
+| 数据划分 | `DistributedSampler`：每张卡看自己那份，所以"一轮"仍然等于整份数据过一遍，轮数语义和单卡一致 |
+| BatchNorm | CUDA 上自动换成 **SyncBatchNorm**（跨卡统计）—— 不换的话 4 卡 × batch2 时每张卡只看到 2 张图，正好踩在 config 里记的"batch=1 严重欠拟合"的边上 |
+| 验证 | 每张卡验自己那份，指标按 (非 nan 的和, 非 nan 的个数) 跨卡汇总 —— 结果与"单卡跑完整验证集"的 nanmean **逐位一致**（有 2 rank 的单元测试） |
+| 日志/权重 | **只有 rank0 写**；其余 rank 的 stdout 也静音（stderr 不动，崩了照样看得见 traceback） |
+| 存的权重 | 用没包过 DDP 的 `raw_model.state_dict()` —— 否则键会多一层 `module.`，`ckpt.load_unet` 读不了 |
+
+**三个要注意的**：
+
+1. **`--workers` 要按卡数摊**：每个 rank 都会起 workers 个进程，4 卡 × 8 workers = 32 个
+   读图进程。服务器上 `--workers 2~4` 就够。
+2. **切片模型（`--crop`）下内存 ×卡数**：那条路要把所有原图按原始分辨率常驻内存
+   （52 张约 6GB），4 个 rank 就是 4 份。
+3. **Windows 上没有 NCCL**，所以 GPU 的 DDP 在 Windows 上跑不起来（代码会直接报错说清楚）；
+   想在 Windows 验证逻辑用 `--cpu`（gloo + CPU，慢但流程完全一样）。
+   Linux 服务器上是 NCCL，正常。
+
+> 本机（Windows）上 `torchrun` 还起不来：这个 torch 没编 libuv，TCPStore 建不了。
+> 验证时是用 `RANK/WORLD_SIZE/LOCAL_RANK` + `ROOT_MODEL_DDP_INIT=file://...`
+> 手动起两个进程跑的（file:// 不碰 TCPStore）。服务器上不需要这个。
+
 ## 使用说明
 
 统一在项目根目录 `D:\python projects\Deep_learning_model_for_sugarcane` 下运行。

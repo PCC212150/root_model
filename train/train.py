@@ -25,6 +25,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py --size  --batch  --workers
 -1 则为cpu
 """
 import argparse
+import contextlib
 import json
 import random
 import sys
@@ -144,6 +145,33 @@ def _accumulate(pb, gt, vd, d_all, i_all):
     i_all.append(is_)
 
 
+def _reduce_val_metric(arrs, ddp):
+    """把各卡上的**逐样本**指标并起来，返回 (C,) 的全局均值（缺标注的通道 = nan）。
+
+    DDP 下每张卡只验证自己那一份样本，直接把均值再平均是错的（各卡样本数可能不等，
+    而且某些通道在某些卡上全是 nan）。所以按 (非 nan 的和, 非 nan 的个数) 两个量分别
+    跨卡求和再相除 —— 结果与"单卡跑完整验证集"的 nanmean 完全一致。
+
+    world=1 时**原样返回**（连 numpy 转换都不做），单卡路径一个字节都没变。
+    """
+    if not ddp.enabled:
+        return None
+    import torch.distributed as dist
+    if not arrs:
+        return None
+    # 注意用 asarray 而不是 concatenate：arrs 是 [(C,), (C,), ...]，
+    # concatenate(axis=0) 会把它**压成一维 (n*C,)** —— 三个通道被混成一个数，
+    # 而且不报错（除了最后 list() 那次）。asarray 才是按行堆成 (n, C)。
+    a = np.asarray(arrs, dtype=np.float64)
+    s = np.nansum(a, axis=0)
+    c = np.sum(~np.isnan(a), axis=0)
+    t = torch.from_numpy(np.stack([s, c]))          # (2, C)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    s, c = t[0].numpy(), t[1].numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(c > 0, s / np.maximum(c, 1.0), np.nan)
+
+
 # 训练大概要多少显存（低于这个值就告警）。1024/batch2 实测 4.4GB；
 # 1536/batch4 在 24G 卡上约 10~12GB。这里给个下限，不够时由 device.pick 告警。
 NEED_GB = 4.5
@@ -251,9 +279,15 @@ def main():
             sys.exit(f"[错误] --pos-weight 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
                      f"当前 {len(pos_weight)} 个: {args.pos_weight}")
 
-    # 自动挑当前最空的 GPU（不再写死 cuda:0 —— 服务器上 4 张卡常有人占着）
-    device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None),
-                             need_gb=NEED_GB)
+    # ---- 多卡（DDP）：torchrun 起才有 LOCAL_RANK，否则就是原来的单卡单进程 ----
+    ddp = device_mod.Dist(cpu=args.cpu)
+    if ddp.enabled:
+        # 多卡时**不能用自动挑卡**：每张卡固定绑一个 rank，挑了也没用
+        device = ddp.init()
+    else:
+        # 自动挑当前最空的 GPU（不再写死 cuda:0 —— 服务器上 4 张卡常有人占着）
+        device = device_mod.pick(cpu=args.cpu, gpu=getattr(args, "gpu", None),
+                                 need_gb=NEED_GB)
     if device.type == "cpu":
         print("[警告] 使用 CPU 训练，速度很慢。pcc 环境支持 CUDA（RTX 5060）。")
 
@@ -286,17 +320,33 @@ def main():
         "验证集样本数不符（名字对不上？）"
     print(f"数据加载完成，用时 {time.time() - t0:.1f}s")
 
+    # DDP：每张卡只看自己那一份（DistributedSampler 把数据集切成 world 份），
+    # 于是"一个 epoch"仍然等于整份数据过一遍 —— 轮数的语义在单卡/多卡下一致。
+    train_sampler = None
+    if ddp.enabled:
+        train_sampler = torch.utils.data.DistributedSampler(
+            train_ds, num_replicas=ddp.world, rank=ddp.rank, shuffle=True)
+        if ddp.is_main:
+            print(f"[DDP] 每张卡每轮 {len(train_sampler)} 个样本"
+                  f"（全量 {len(train_ds)} / {ddp.world} 卡）")
     loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=args.batch, shuffle=True, drop_last=True,
+        train_ds, batch_size=args.batch, sampler=train_sampler,
+        shuffle=train_sampler is None, drop_last=True,
         num_workers=args.workers, pin_memory=True,
         persistent_workers=args.workers > 0)
     # 切片模型的验证是「逐张整图滑窗」，用不上 DataLoader；而且硬建一个会让每个
     # worker 都持有一份整图（Windows 的 spawn 是真拷贝，几百 MB × workers）。
     val_loader = None
     if not args.crop:
+        # 验证集也分片：每张卡算自己那份，最后把**逐样本指标**跨卡汇总
+        # （见 _reduce_val —— 不能简单对平均值再平均，各卡样本数可能不等）
+        val_sampler = None
+        if ddp.enabled:
+            val_sampler = torch.utils.data.DistributedSampler(
+                val_ds, num_replicas=ddp.world, rank=ddp.rank, shuffle=False)
         val_loader = torch.utils.data.DataLoader(
-            val_ds, batch_size=args.batch, shuffle=False, num_workers=args.workers,
-            persistent_workers=args.workers > 0)
+            val_ds, batch_size=args.batch, sampler=val_sampler, shuffle=False,
+            num_workers=args.workers, persistent_workers=args.workers > 0)
     if args.workers == 0 and device.type == "cuda":
         print("[提示] num_workers=0：读图与数据增强在主进程里同步做，GPU 会空等。"
               "服务器上可加 --workers 8（本机 Windows 保持 0 即可）。")
@@ -306,8 +356,24 @@ def main():
         print(f"[警告] 归一化用 BatchNorm 但 batch={args.batch}：batch=1 时读到的统计量"
               f"与推理用的滑动平均对不上，会出现严重欠分割。请用 batch≥2 或把 "
               f"config.NORM 改成 'group'。")
-    model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
+    model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
+    # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
+    # "SyncBatchNorm layers only work with GPU modules"
+    if ddp.enabled and args.norm == "batch" and device.type == "cuda":
+        # **必须换 SyncBatchNorm**：DDP 下每张卡只算自己那批的统计量，4 卡 × batch2
+        # 时每张卡只看到 2 张图 —— 正好踩在 config 里记的"batch=1 严重欠分割"的边上。
+        # SyncBN 每步跨卡同步统计量，等效于"单卡跑 global batch"，与多卡前的结果可比。
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if ddp.is_main:
+            print("[DDP] BatchNorm -> SyncBatchNorm（跨卡统计，等效于单卡的等效 batch）")
+    model = model.to(device)
+    if ddp.enabled:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[ddp.local_rank] if device.type == "cuda" else None)
+    # 存权重/取参数都要用**没包过的那份**：DDP 包装后 state_dict() 的键会多一层
+    # "module." 前缀，存出来的 ckpt 用 ckpt.load_unet 加载会直接报键不匹配。
+    raw_model = model.module if hasattr(model, "module") else model
+    n_params = sum(p.numel() for p in raw_model.parameters())
     eff_batch = args.batch * args.accum
     print(f"U-Net 参数量: {n_params / 1e6:.2f}M | "
           + (f"切片训练 块 {args.crop}×{args.crop}（原图不缩放）"
@@ -340,13 +406,26 @@ def main():
     ts = naming.timestamp()
     # create_unique_dir 而非 unique_path：同一分钟内启动两个训练（一张卡一个）时，
     # 「先查后建」的写法会让两个进程拿到同一个名字、其中一个直接崩；这里是原子创建。
-    folder = naming.create_unique_dir(args.out_dir, naming.model_folder_name(ts))
+    # 只有 rank0 建目录（4 个进程同时 create_unique_dir 会各拿到一个 -1/-2 后缀），
+    # 再把名字广播给其余 rank —— 它们虽然不写文件，但 hparams 里的 model_name 要一致。
+    if ddp.enabled:
+        folder_name = ddp.broadcast_object(
+            naming.model_folder_name(ts) if ddp.is_main else None)
+        folder = args.out_dir / folder_name
+        if ddp.is_main:
+            folder.mkdir(parents=True, exist_ok=True)
+        ddp.barrier()
+    else:
+        folder = naming.create_unique_dir(args.out_dir, naming.model_folder_name(ts))
     ckpt_path = folder / f"{folder.name}.pth"
     log_path = folder / f"{folder.name}_log.txt"
     hparams = {k: (str(v) if isinstance(v, Path) else v)
                for k, v in vars(args).items()}
-    hparams.update({"device": str(device), "gpu": torch.cuda.get_device_name(0)
+    hparams.update({"device": str(device),
+                    "gpu": torch.cuda.get_device_name(device.index or 0)
                     if device.type == "cuda" else "cpu",
+                    "ddp_world_size": ddp.world, "ddp_rank": ddp.rank,
+                    "ddp_backend": ddp.backend,
                     "val_names": val_names, "train_names": train_names,
                     "val_plants": val_plants, "train_plants": train_plants,
                     "class_names": list(config.CLASS_NAMES), "out_ch": N_CH,
@@ -359,10 +438,14 @@ def main():
                     "params_M": round(n_params / 1e6, 2),
                     "start": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "model_name": folder.name})
-    with open(folder / "hparams.json", "w", encoding="utf-8") as f:
-        json.dump(hparams, f, ensure_ascii=False, indent=2)
+    if ddp.is_main:
+        with open(folder / "hparams.json", "w", encoding="utf-8") as f:
+            json.dump(hparams, f, ensure_ascii=False, indent=2)
 
     def log(msg, console=True):
+        """日志与打印**只有 rank0 做** —— 否则几个进程会往同一个文件里交错写好几份。"""
+        if not ddp.is_main:
+            return
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
         if console:
@@ -372,6 +455,9 @@ def main():
         f"hparams: {json.dumps(hparams, ensure_ascii=False)}", console=False)
     log(f"[信息] {hparams['gpu']} | 参数量 {n_params/1e6:.2f}M | "
         f"输入 {args.size} | batch {args.batch}"
+        # DDP 下 --batch 是**每张卡**的，这里把跨卡的等效 batch 也写出来，
+        # 免得拿多卡的数字跟单卡历史值直接比
+        + (f"×{ddp.world}卡={args.batch * ddp.world}" if ddp.enabled else "")
         + (f"×累积{args.accum}={eff_batch}" if args.accum > 1 else "")
         + f" | lr {args.lr} | "
         f"epochs {args.epochs} | 训练 {len(train_names)} 组 | "
@@ -398,6 +484,9 @@ def main():
     try:
         for epoch in range(1, args.epochs + 1):
             t_ep = time.time()
+            # DDP：不给 sampler 播种的话，每轮的洗牌顺序**一模一样**（相当于没有 shuffle）
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             model.train()
             loss_sum, n_batch = 0.0, 0
             cd_sum, cd_valid, cd_degen = 0.0, 0, 0
@@ -432,10 +521,17 @@ def main():
                         cd_sum += float(cd[ok].sum())
                         cd_valid += int(ok.sum())
                         cd_degen += int(dg.sum())
-                # 梯度累积：把 loss 按累积步数缩放，攒够 accum 个 micro-batch 再更新一次
-                scaler.scale(loss / args.accum).backward()
+                # 梯度累积：把 loss 按累积步数缩放，攒够 accum 个 micro-batch 再更新一次。
+                # DDP 下**中间那几步不必同步梯度** —— 默认每步都 all-reduce，累积 N 步
+                # 就白通信 N-1 次（小 batch 下这个开销占比不小）。
                 n_micro += 1
-                if n_micro >= args.accum or (i_batch + 1) == len(loader):
+                need_step = n_micro >= args.accum or (i_batch + 1) == len(loader)
+                ctx = (model.no_sync() if (ddp.enabled and not need_step
+                                           and hasattr(model, "no_sync"))
+                       else contextlib.nullcontext())
+                with ctx:
+                    scaler.scale(loss / args.accum).backward()
+                if need_step:
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
@@ -455,8 +551,14 @@ def main():
                     # 再与整图真值比。与「单个裁块」相比，这里的 check 通道能真正被量到
                     # （裁块的 GT 几乎全 True，预测全 True 就 0.99，是退化的）。
                     from common import predict as _predict
+                    # DDP：val_ds 这里是直接遍历的（切片模型不走 DataLoader），
+                    # 所以自己按 rank 切片 —— 不然每张卡都验全量，重复 world 倍
+                    _vds = val_ds
+                    if ddp.enabled:
+                        _vds = torch.utils.data.Subset(
+                            val_ds, list(range(ddp.rank, len(val_ds), ddp.world)))
                     with torch.no_grad():
-                        for x, y, _, valid in val_ds:   # 逐张：整图 5472x3648 没法 batching
+                        for x, y, _, valid in _vds:     # 逐张：整图 5472x3648 没法 batching
                             img = (x.permute(1, 2, 0).numpy() * 255.0).round() \
                                 .astype(np.uint8)
                             prob = _predict.tiled_probs(model, img, args.crop,
@@ -475,9 +577,14 @@ def main():
                             for i in range(len(gt)):
                                 _accumulate(pb[i], gt[i], vd[i], d_all, i_all)
                 if d_all:
-                    with np.errstate(invalid="ignore"):
-                        per_ch_dice = list(np.nanmean(np.asarray(d_all), axis=0))
-                        per_ch_iou = list(np.nanmean(np.asarray(i_all), axis=0))
+                    if ddp.enabled:
+                        # 各卡只验了自己那份，先跨卡并成全局均值（结果 = 整份验证集的 nanmean）
+                        per_ch_dice = list(_reduce_val_metric(d_all, ddp))
+                        per_ch_iou = list(_reduce_val_metric(i_all, ddp))
+                    else:
+                        with np.errstate(invalid="ignore"):
+                            per_ch_dice = list(np.nanmean(np.asarray(d_all), axis=0))
+                            per_ch_iou = list(np.nanmean(np.asarray(i_all), axis=0))
                     # 整个验证集都没有该通道标注时 nanmean 会返回 nan，统一记成 -1；
                     # 一律转成 Python float：numpy 标量写进 ckpt 会让 torch.load 的
                     # weights_only 模式（torch>=2.6 默认）拒绝加载
@@ -514,12 +621,17 @@ def main():
             if improved:
                 best_select, best_root, best_stem = select_dice, val_dice, stem_dice
                 best_epoch = epoch
-                torch.save({"state_dict": model.state_dict(), "epoch": epoch,
-                            "val_dice": val_dice, "select_dice": select_dice,
-                            "stem_dice": stem_dice, "hparams": hparams,
-                            "out_ch": N_CH, "norm": args.norm,
-                            "class_names": list(config.CLASS_NAMES)},
-                           ckpt_path)
+                # **raw_model**：DDP 包装后 model.state_dict() 的键多一层 "module." 前缀，
+                # 存出来的 ckpt 用 ckpt.load_unet 加载会报键不匹配。
+                # 各 rank 的 select_dice 经过 all_reduce 后完全一致，所以"哪一轮最好"
+                # 所有卡都同意 —— 只在 rank0 写盘就行。
+                if ddp.is_main:
+                    torch.save({"state_dict": raw_model.state_dict(), "epoch": epoch,
+                                "val_dice": val_dice, "select_dice": select_dice,
+                                "stem_dice": stem_dice, "hparams": hparams,
+                                "out_ch": N_CH, "norm": args.norm,
+                                "class_names": list(config.CLASS_NAMES)},
+                               ckpt_path)
                 bad_epochs = 0
             else:
                 bad_epochs += 1
@@ -560,13 +672,18 @@ def main():
                 break
     except KeyboardInterrupt:
         log("[中断] 收到 Ctrl-C，保存已训练到当前轮的模型权重。")
-        torch.save({"state_dict": model.state_dict(), "epoch": epoch,
-                    "val_dice": val_dice,
-                    "select_dice": select_dice,
-                    "stem_dice": per_ch_dice[1] if N_CH > 1 else -1.0, "hparams": hparams,
-                    "out_ch": N_CH, "norm": args.norm,
-                    "class_names": list(config.CLASS_NAMES)},
-                   ckpt_path)
+        if ddp.is_main:
+            torch.save({"state_dict": raw_model.state_dict(), "epoch": epoch,
+                        "val_dice": val_dice,
+                        "select_dice": select_dice,
+                        "stem_dice": per_ch_dice[1] if N_CH > 1 else -1.0,
+                        "hparams": hparams,
+                        "out_ch": N_CH, "norm": args.norm,
+                        "class_names": list(config.CLASS_NAMES)},
+                       ckpt_path)
+    finally:
+        # 进程组一定要销毁：不然 DDP 的 NCCL 通信线程会吊着，进程退不干净
+        ddp.close()
 
     total = time.time() - t_start
     if best_epoch > 0:
@@ -576,7 +693,8 @@ def main():
     else:
         log(f"[完成] 模型已保存: {ckpt_path}")
     log(f"[完成] 总训练用时 {total / 60:.1f} 分钟 | 日志: {log_path}")
-    print(f"\n模型目录: {folder}\n日志文件: {log_path}")
+    if ddp.is_main:
+        print(f"\n模型目录: {folder}\n日志文件: {log_path}")
 
 
 def _pairs(data_dir):
