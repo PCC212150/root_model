@@ -98,22 +98,28 @@ MASK_LINE_WIDTH = 10
 #   任意 GroupNorm         +4GB 显存 → 在 8G 卡上一律溢出，**本机不要用**
 # 想要更高分辨率（细根从 1.9px 变 2.9px）请在服务器（24G）上训：--size 1536 --batch 4。
 
-# ---- --size 能开多大：显存账（2026-10-08 用 tool/mem_probe 在服务器 3090 上实测） ----
-# 显存 ≈ 固定开销 + 斜率 × (输入像素数 × batch)，**斜率取决于归一化**：
-#     BatchNorm（本项目默认）：≈ 0.2 + 2.89 GB/(Mpx·batch)
-#     GroupNorm              ：≈ 0.4 + 5.78 GB/(Mpx·batch)  ← 正好翻倍
-# 实测锚点（3090 24G，AMP 开）：
-#     1024/1024x688   batch2  BatchNorm ≈ 4.4 GB   GroupNorm 8.57 GB
-#     1536/1536x1024  batch2  BatchNorm ≈ 9.3 GB   GroupNorm 18.60 GB
-# 24G 卡按 BatchNorm、留 10% 余量，**每张卡**能装下的上限：
-#     batch 1 → --size 约 3200     batch 4 → 约 1600
-#     batch 2 → --size 约 2300     batch 8 → 约 1150
+# ---- --size 能开多大：显存账（2026-10-08 在服务器 3090 上实测） ----
+# 显存 ≈ 固定开销 + 斜率 × (输入像素数 × batch)，**斜率取决于归一化**（正好差一倍）：
+#     BatchNorm（本项目默认）：0.41 + 2.817 GB/(Mpx·batch)   ← 3090 上实测拟合，残差 0.001
+#     GroupNorm              ：0.43 + 5.779 GB/(Mpx·batch)
+# 实测锚点（3090 24G / 可用 23.6G，AMP 开，BatchNorm）：
+#     1024x688  b2  4.38 GB   |  2048x1360 b2 16.10 GB
+#     1536x1024 b2  9.27 GB   |  2048x1360 b4 32.6 GB ✗OOM
+#     1536x1024 b4 18.14 GB   |  2560x1712 b2 25.5 GB ✗OOM
+# 单张 3090 上**实测确认装得下**的最大档（留 10~15% 余量）：
+#     batch 1 → --size 2736（14.5GB；3648 要 25.4GB，超了）
+#     batch 2 → --size 2048（16.1GB；2736 要 28.5GB，超了）
+#     batch 4 → --size 1536（18.1GB；2048 要 32.6GB，超了）
 # ⚠️ **DDP 多卡不改变这个上限**：多卡是把 batch 切开、不是把图切开，每张卡还是要装下
 #    整个输入。多卡买到的是**吞吐**（同样 52 分钟能跑 3 个配置），不是更大的 size。
+#    但 DDP 有个**例外的好处**：BatchNorm 换成 SyncBatchNorm 后统计量跨卡算，
+#    于是"每卡 batch=1"不再是禁忌（全局 batch = 卡数）—— config.NORM 里那条
+#    "batch=1 严重欠分割"针对的是单卡。
 # ⚠️ `--size 3648` **不是原分辨率**（那只是缩到 0.667×；原图长边是 5472）。
 #    要真·原分辨率只有走 `--crop`（切片训练，在原分辨率上裁块）。
-# 每次换 / 换 batch 之前，用 `python tool/mem_probe/mem_probe.py --size ... --batch ...`
-# 实测一遍最稳（它按 config.NORM 默认，和训练口径一致）。
+# 换 size / 换 batch 之前用 `python tool/mem_probe/mem_probe.py --size ... --batch ...`
+# 实测一遍最稳（它默认按 config.NORM）。注意探针**不含数据加载与增强**，是下界：
+# 真实训练还要 +几%（DDP 的 SyncBN 再多一点），所以别顶着 23.6G 开。
 MAX_SIDE = 1024
 
 
