@@ -79,10 +79,73 @@ def _other_dir(data_dir) -> Path:
     return sub if sub.is_dir() else d
 
 
+# 数据集支持**按来源分子目录**（2026-10-08 起）：
+#
+#     datasets/root/train/
+#         GT/     人工标的多边形 + 像素掩码（masks/）—— 真值
+#         scr/    老数据：折线膨胀出来的伪标签（只有 json 的 10px 折线）
+#
+# 每个来源子目录都是一份**独立完整**的扁平数据集（图 + json + 自己的 masks/），
+# 所以 `load_annot` 传进去的 data_dir 就是子目录本身，找 masks/<名>.png 自然是对的。
+# 好处：两种真值口径（掩码 vs 折线）**各自走各自的路**，不需要在代码里分支；
+# 训练侧还能按来源给损失加权（伪标签降权，见 train.py 的 --src-weight）。
+#
+# 下面这几个名字是**结构目录**，不是来源 —— 扫描时要跳过：
+# masks/overlay 是标注工具的产物目录，images/labels 是老的嵌套布局。
+SOURCE_DIRS_RESERVED = {"masks", "overlay", "images", "labels", "cache"}
+
+
+def source_dirs(data_dir) -> list:
+    """[(来源名, 该来源的目录), ...]。
+
+    没有来源子目录时返回 `[("", data_dir)]` —— 也就是**原来那种一层的布局照常能用**，
+    老数据集一个字节都不用动。
+    """
+    d = Path(data_dir)
+    if not d.is_dir():
+        return []
+    subs = []
+    for p in sorted(d.iterdir()):
+        if not p.is_dir() or p.name in SOURCE_DIRS_RESERVED:
+            continue
+        if any(q.is_file() and q.suffix.lower() in config.IMAGE_EXTS
+               for q in p.iterdir()):
+            subs.append((p.name, p))
+    return subs or [("", d)]
+
+
+def source_of(data_dir, img_path) -> str:
+    """这张图属于哪个来源：`<data_dir>/<来源>/图.jpg` -> "<来源>"；直接在 data_dir 下 -> ""。"""
+    p = Path(img_path).parent
+    d = Path(data_dir)
+    if p != d and p.parent == d and p.name not in SOURCE_DIRS_RESERVED:
+        return p.name
+    return ""
+
+
 def find_other(data_dir, stem):
-    """找该图的 labelme 标注（茎/检查范围/新格式的根系）；没有返回 None。"""
-    p = _other_dir(data_dir) / f"{stem}.json"
+    """找该图的 labelme 标注（茎/检查范围/新格式的根系）；没有返回 None。
+
+    **顶层找不到就去各来源子目录里找** —— 见 `sample_dir`。
+    """
+    p = _other_dir(sample_dir(data_dir, stem)) / f"{stem}.json"
     return p if p.exists() else None
+
+
+def sample_dir(data_dir, stem) -> Path:
+    """这个样本（stem）**实际住在哪个目录**：顶层，或某个来源子目录（GT/scr/...）。
+
+    2026-10-08 加。由来：`discover_pairs` 改成会扫来源子目录之后，
+    `load_annot` 还只在顶层找 `<data_dir>/<名>.json` —— 于是每张图都被判成
+    "没有 json"，88 张全报"缺 stem/check 标注"（训练时那两个通道的损失会被整体屏蔽）。
+    样本住哪儿，标注和 `masks/<名>.png` 就在哪儿的旁边，所以统一从这里解析。
+    """
+    d = Path(data_dir)
+    for base in [d] + [b for _s, b in source_dirs(d) if b != d]:
+        if ((_other_dir(base) / f"{stem}.json").exists()
+                or (_roots_dir(base) / f"{stem}.rsml").exists()):
+            return base
+    return d
 
 
 def discover_pairs(data_dir, image_exts=None) -> list:
@@ -103,20 +166,23 @@ def discover_pairs(data_dir, image_exts=None) -> list:
         from config import IMAGE_EXTS
         image_exts = IMAGE_EXTS
     data_dir = Path(data_dir)
-    img_dir = _images_dir(data_dir)
-    if not img_dir.is_dir():
-        return []
-    roots_dir = _roots_dir(data_dir)
-    other_dir = _other_dir(data_dir)
     pairs = []
-    for img_path in sorted(p for p in img_dir.iterdir()
-                           if p.suffix.lower() in image_exts):
-        json_path = other_dir / f"{img_path.stem}.json"
-        rsml_path = roots_dir / f"{img_path.stem}.rsml"
-        if json_path.exists():
-            pairs.append((img_path.stem, img_path, json_path))
-        elif rsml_path.exists():
-            pairs.append((img_path.stem, img_path, rsml_path))
+    # **顶层 + 各来源子目录**都扫（见 source_dirs 的说明）。顶层是空的也没关系
+    # （只有子目录时它扫出 0 个，不影响）。
+    for _src, base in source_dirs(data_dir):
+        img_dir = _images_dir(base)
+        if not img_dir.is_dir():
+            continue
+        roots_dir = _roots_dir(base)
+        other_dir = _other_dir(base)
+        for img_path in sorted(p for p in img_dir.iterdir()
+                               if p.suffix.lower() in image_exts):
+            json_path = other_dir / f"{img_path.stem}.json"
+            rsml_path = roots_dir / f"{img_path.stem}.rsml"
+            if json_path.exists():
+                pairs.append((img_path.stem, img_path, json_path))
+            elif rsml_path.exists():
+                pairs.append((img_path.stem, img_path, rsml_path))
     return pairs
 
 
@@ -171,6 +237,9 @@ def load_annot(data_dir, stem, orig_size=None, verbose=True) -> Annot:
     返回的 `source` 标注了根系实际来自哪条路，调用方（尤其是验证脚本）应当据此判断
     格式迁移是否真的生效。
     """
+    # 样本可能住在来源子目录里（GT/scr）；标注与 masks/<名>.png 都在它旁边，
+    # 所以这里把 data_dir 换成**它实际住的目录**（见 sample_dir）。
+    data_dir = sample_dir(data_dir, stem)
     json_path = find_other(data_dir, stem)
     rsml_path = _roots_dir(data_dir) / f"{stem}.rsml"
     rsml_path = rsml_path if rsml_path.exists() else None
@@ -306,7 +375,7 @@ def load_root_mask_png(annot, target_size):
     return arr > 127
 
 
-def build_target_masks(annot, target_size, mask_width):
+def build_target_masks(annot, target_size, mask_width, use_mask: bool = True):
     """画三通道真值掩码，返回 (masks[h,w,3] bool, chan_valid[3] float)。
 
     annot: `load_annot()` 的返回值；原图尺寸从 `annot.orig_size` 取 ——
@@ -373,7 +442,9 @@ def build_target_masks(annot, target_size, mask_width):
     # 放在最后覆盖，是为了让"有没有掩码"只影响 root 一个通道，别的逻辑一行都不用分叉。
     # ⚠️ 掩码和多边形是**两把尺子**（实测 root 面积差约 1.6%）：同一批数据要么都有
     #    掩码、要么都没有，混着用等于一半图一个口径。
-    root_px = load_root_mask_png(annot, target_size)
+    # use_mask=False 时**忽略像素掩码**，一律走多边形/折线那条路 ——
+    # 用来做「掩码 vs 多边形」的 A/B 对照（同一批图、同一份标注，只换真值口径）。
+    root_px = load_root_mask_png(annot, target_size) if use_mask else None
     if root_px is not None:
         masks[:, :, CH_ROOT] = root_px
         valid[CH_ROOT] = 1.0
@@ -418,8 +489,9 @@ class RootDataset(Dataset):
 
     def __init__(self, data_dir, names=None, max_side=1024, stride=16,
                  mask_width=5, augment=False, seed=0, crop=0, crop_repeat=1,
-                 full=False):
+                 full=False, use_mask=True):
         self.augment = augment
+        self.use_mask = bool(use_mask)
         self.data_dir = Path(data_dir)
         self.crop = int(crop or 0)
         # full=True：**整图、原始分辨率、不缩放也不裁**。给「验证切片模型」用 ——
@@ -448,6 +520,8 @@ class RootDataset(Dataset):
                 missing = sorted(wanted - {p[0] for p in pairs})
                 print(f"[警告] 有 {len(missing)} 个名字在数据集中找不到配对: {missing[:5]}")
         self.names = [p[0] for p in pairs]
+        # 每个样本的「来源」（GT / scr / ""）—— 训练侧按它给损失加权（伪标签降权）
+        srcs = [source_of(self.data_dir, p[1]) for p in pairs]
 
         self.items = []
         n_no_other = 0
@@ -463,14 +537,16 @@ class RootDataset(Dataset):
                     raise ValueError(f"crop={self.crop} 比 {name} 的短边({min(w0, h0)})还大，"
                                      f"裁不出块来")
                 # 掩码在**原图分辨率**上画（orig=target），裁块/整图时坐标天然对齐
-                masks, valid = build_target_masks(annot, (w0, h0), mask_width)
+                masks, valid = build_target_masks(annot, (w0, h0), mask_width,
+                                                  use_mask=self.use_mask)
                 bytes_full += img.nbytes + masks.nbytes
                 item = {"name": name, "img": img, "masks": masks, "valid": valid,
                         "fill": _corner_fill(img),
                         "bbox": _annot_bbox(masks) if self.crop else None}
             else:
                 w1, h1 = image_io.target_size(w0, h0, max_side, stride)
-                masks, valid = build_target_masks(annot, (w1, h1), mask_width)
+                masks, valid = build_target_masks(annot, (w1, h1), mask_width,
+                                                  use_mask=self.use_mask)
                 item = {"name": name,
                         "img": image_io.resize_rgb(img, w1, h1),   # (h1,w1,3) uint8
                         "masks": masks,                            # (h1,w1,3) bool
@@ -478,6 +554,7 @@ class RootDataset(Dataset):
                         "fill": _corner_fill(img), "bbox": None}
             if valid[CH_STEM] == 0 or valid[CH_CHECK] == 0:
                 n_no_other += 1
+            item["src"] = srcs[len(self.items)]
             self.items.append(item)
         if self.crop:
             print(f"[切片训练] 原图不缩放，每轮随机裁 {self.crop}×{self.crop}，"
@@ -490,6 +567,12 @@ class RootDataset(Dataset):
         if n_no_other:
             print(f"[警告] {n_no_other} 张图缺 stem/check 标注（labels/other 里没有对应 "
                   f"json），训练时这两个通道的损失会被屏蔽。")
+        # 多来源时把构成打出来（GT / scr 各多少组）—— 混着训的时候这是最该先看见的一行
+        n_src = {}
+        for it in self.items:
+            n_src[it["src"] or "(无来源)"] = n_src.get(it["src"] or "(无来源)", 0) + 1
+        if len(n_src) > 1:
+            print("[来源] " + " | ".join(f"{k}: {v} 组" for k, v in sorted(n_src.items())))
         if n_legacy:
             print(f"[警告] {n_legacy} / {len(self.items)} 张图仍用**旧格式**（根系在 .rsml 里）。\n"
                   f"        建议跑一次 tool\\merge_annot 把根系并进 json —— 新旧混用时"

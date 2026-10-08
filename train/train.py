@@ -195,6 +195,12 @@ def parse_args():
     p.add_argument("--accum", type=int, default=config.ACCUM,
                    help="梯度累积步数：等效 batch = --batch × --accum。显存不够时用它换等效 batch"
                         "（默认见 config.ACCUM）")
+    p.add_argument("--src-weight", type=float, default=1.0,
+                   help="非 GT 来源（伪标签，如 scr）的损失权重；GT 恒为 1.0。"
+                        "默认 1.0 = 两批数据同等对待；设 0.3 就是给伪标签打折")
+    p.add_argument("--no-gt-mask", action="store_true",
+                   help="忽略 GT 的像素级掩码，改用 json 里的多边形 —— 做"
+                        "「掩码 vs 多边形」的 A/B 对照时用")
     p.add_argument("--epochs", type=int, default=config.EPOCHS)
     p.add_argument("--lr", type=float, default=config.LR)
     p.add_argument("--patience", type=int, default=config.PATIENCE,
@@ -302,6 +308,7 @@ def main():
     print(f"验证植株: {', '.join(val_plants) if val_plants else '无(不早停,保存最后轮)'}")
     t0 = time.time()
     train_ds = RootDataset(args.data_dir, names=train_names,
+                           use_mask=not args.no_gt_mask,
                            max_side=args.size, augment=True, seed=args.seed,
                            crop=args.crop, crop_repeat=args.crop_repeat)
     # 验证集的预处理必须与**部署形式**一致：
@@ -311,6 +318,7 @@ def main():
     # 全是 True，预测全 True 就能拿 Dice 0.99（实测日志里从第 21 轮起恒为 0.99），
     # 于是 select_dice / 早停 / LR 调度全在一个假信号上跑 —— 整轮实验都是盲的。
     val_ds = RootDataset(args.data_dir, names=val_names,
+                         use_mask=not args.no_gt_mask,
                          max_side=args.size, augment=False, seed=args.seed,
                          crop=0, crop_repeat=1, full=bool(args.crop))
     # 切片模式下 len(ds) = 图片数 × crop_repeat，所以断言要按图片数比
@@ -350,6 +358,18 @@ def main():
     if args.workers == 0 and device.type == "cuda":
         print("[提示] num_workers=0：读图与数据增强在主进程里同步做，GPU 会空等。"
               "服务器上可加 --workers 8（本机 Windows 保持 0 即可）。")
+
+    # ---- 逐样本的来源权重（伪标签降权）----
+    # GT（人工标注 + 像素掩码）恒为 1.0；其余来源乘 --src-weight。
+    # 加权的**方式**很关键：把它乘进损失的逐样本权重里，让分母（wb.sum()）跟着一起变 ——
+    # 那才是"这条样本对梯度的贡献打折"；只把损失值乘小、分母不动的话，会被整体稀释掉。
+    src_w_lut = {it["name"]: (1.0 if (it["src"] in ("", "GT")) else args.src_weight)
+                 for it in train_ds.items}
+    use_src_w = any(v != 1.0 for v in src_w_lut.values())
+    if use_src_w:
+        n_gt = sum(1 for v in src_w_lut.values() if v == 1.0)
+        print(f"[来源权重] GT {n_gt} 组 ×1.0 | 其余 {len(src_w_lut) - n_gt} 组 "
+              f"×{args.src_weight}")
 
     # ---- 模型 ----
     if args.norm == "batch" and args.batch < 2:
@@ -492,8 +512,12 @@ def main():
             cd_sum, cd_valid, cd_degen = 0.0, 0, 0
             optimizer.zero_grad(set_to_none=True)
             n_micro = 0
-            for i_batch, (x, y, _, valid) in enumerate(loader):
+            for i_batch, (x, y, batch_names, valid) in enumerate(loader):
                 x, y, valid = x.to(device), y.to(device), valid.to(device)
+                sw = None
+                if use_src_w:
+                    sw = torch.tensor([src_w_lut[n] for n in batch_names],
+                                      dtype=torch.float32, device=device)[:, None]
                 with torch.autocast(device_type="cuda", enabled=amp):
                     out = model(x)
                     prob = torch.sigmoid(out)
@@ -505,8 +529,12 @@ def main():
                         out.float(), y, pos_weight=pos_w,
                         reduction="none").mean(dim=(2, 3))
                     wb = channel_weights(config.LOSS_BCE_W, valid)
+                    if sw is not None:
+                        wb = wb * sw              # (B,C) × (B,1)，逐样本加权
                     loss_bce = (bce * wb).sum() / wb.sum().clamp(min=1e-6)
                     wd = channel_weights(config.LOSS_DICE_W, valid)
+                    if sw is not None:
+                        wd = wd * sw
                     loss_dice = ((dice_loss(prob.float(), y) * wd).sum()
                                  / wd.sum().clamp(min=1e-6))
                     loss = loss_bce + loss_dice
