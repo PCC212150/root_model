@@ -11,6 +11,9 @@
     python inference.py --dir D:\\...\\某图片文件夹 --overlay-jpg       # overlay 存 JPEG（快 47 倍）
     python inference.py --dir <文件夹> --jobs 4                       # 并发 4 张（吞吐约 2~3 倍）
     python inference.py --model model_a,model_b --dir ...              # 多模型集成
+    python inference.py --dir <文件夹> --show root                    # 只画/只导 root
+    python inference.py --dir <文件夹> --show root,stem               # overlay 只画这两类
+    python inference.py --dir <文件夹> --root-shape polygon           # root 只出多边形（不出折线）
 
 输入长边默认取**模型训练时的设置**（从权重里读），只有显式给 --size 才覆盖 ——
 尺度必须与训练一致，否则精度会明显下降。
@@ -30,9 +33,19 @@
                             文件末尾是若干以 # 开头的汇总行（Excel 可见，脚本可跳过）
     - {图片名}_overlay.png  原图 + 根系(红) + 茎(橙) + 检查范围(绿框)
                             （--overlay-jpg 时为 .jpg，写一张快 47 倍）
-    - {图片名}.json         预测根系折线（labelme 格式，与**标注**同格式）
+    - {图片名}.json         **labelme 格式**（与标注同格式、可直接打开）：
+                            root 折线（骨架中心线）+ root 多边形（掩码轮廓）
+                            + stem 多边形 + check_background 矩形
     - {图片名}_mask.png     统计口径的根系掩码（**默认不存**，加 --save-mask 才出）
 目录/文件重名时自动追加 -1、-2 …（项目规范）。
+
+**--show / --root-shape**（2026-10-06 加）控制 overlay 画什么、json 写哪些标签：
+    --show        逗号分隔，可选 root / stem / check_background（简写 check），
+                  默认三个全要；`--show root` 时 overlay 只画根、json 只写 root
+    --root-shape  root 导哪种形状：both（默认，折线+多边形）/ line（只折线）/ polygon（只多边形）
+**同名 root 的两种形状并存是有意的**：折线是统计口径（骨架），多边形是真实轮廓
+（在 labelme 里改完就能直接当标注用）。解析侧有规则「有 root 多边形就忽略 root 折线」，
+不会把一根数成两根（见 common/labelme.py）。CSV 统计不受 --show 影响。
 
 **总根系面积** = 统计口径的根系掩码像素数（已限定在检查范围内），单位 px²。
 它比根长脆弱得多：根长是骨架长度、几乎不受线宽/阈值影响，而面积随线宽与二值化阈值
@@ -69,6 +82,7 @@ from common import ckpt, image_io, naming, predict  # noqa: E402
 from common.dataset import CH_CHECK, CH_ROOT, CH_STEM  # noqa: E402
 from common.labelme_export import write_labelme_json  # noqa: E402
 from common.skeleton_stats import analyze_mask_ex  # noqa: E402
+from common.labelme_export import mask_to_polygons  # noqa: E402
 
 
 def parse_argv():
@@ -77,11 +91,21 @@ def parse_argv():
     save_mask = False
     overlay_fmt = "png"
     jobs = 1
+    show = None               # None/空 = 全部三标签（root + stem + check_background）
+    root_shape = "both"       # root 的形状：both / line / polygon
     tokens = sys.argv[1:]
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        if t == "--save-mask":
+        if t == "--show":
+            # 控制 overlay 画什么、json 里写哪些标签。逗号分隔，见 parse_show
+            show = tokens[i + 1] if i + 1 < len(tokens) else ""
+            i += 2
+        elif t == "--root-shape":
+            # root 用哪种形状导出：both（默认，折线+多边形）/ line / polygon
+            root_shape = (tokens[i + 1] if i + 1 < len(tokens) else "both").lower()
+            i += 2
+        elif t == "--save-mask":
             save_mask = True
             i += 1
         elif t == "--jobs":
@@ -123,7 +147,8 @@ def parse_argv():
                 print(f"[错误] 无法识别的参数: {t}")
                 sys.exit(1)
             i += 1
-    return model, folder, mm_per_px, size, save_mask, overlay_fmt, jobs
+    return (model, folder, mm_per_px, size, save_mask, overlay_fmt, jobs,
+            show, root_shape)
 
 
 _BLEND_LUT = {}
@@ -143,8 +168,37 @@ def _blend_lut(color, alpha):
     return _BLEND_LUT[key]
 
 
-def make_overlay(img: np.ndarray, masks, check_box, alpha: float = 0.45) -> np.ndarray:
+SHOW_LABELS = ("root", "stem", "check_background")
+_ROOT_SHAPES = ("both", "line", "polygon")
+
+
+def parse_show(s):
+    """`--show` 的值 → 要显示/导出的标签集合。
+
+    空 / `all` / `*` = 全部三个（默认）；支持逗号或 `+` 分隔；`check` 是
+    `check_background` 的简写。不认识的值直接报错退出（别静默当成"全部"）。
+    """
+    if not s or s.strip().lower() in ("all", "*"):
+        return set(SHOW_LABELS)
+    out = set()
+    for part in s.replace("+", ",").split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        p = {"check": "check_background", "bg": "check_background"}.get(p, p)
+        if p not in SHOW_LABELS:
+            sys.exit(f"[错误] --show 不认识 {part.strip()!r}；可选 "
+                     f"{'、'.join(SHOW_LABELS)}（或 all）")
+        out.add(p)
+    return out or set(SHOW_LABELS)
+
+
+def make_overlay(img: np.ndarray, masks, check_box, alpha: float = 0.45,
+                 show=None) -> np.ndarray:
     """把识别结果叠到原图上：根(红) + 茎(橙)，检查范围画绿框。
+
+    show: 只画哪些标签（None=全部），见 parse_show —— `--show root` 时只画根。
+
 
     在 uint8 上直接查表混合，不再升到 float32：省掉一张 5472x3648 的 float32 拷贝
     （240MB，多进程并发时这个内存峰值是按份数翻的），也快一截。
@@ -153,11 +207,15 @@ def make_overlay(img: np.ndarray, masks, check_box, alpha: float = 0.45) -> np.n
     """
     out = img.copy()
     cols = np.arange(out.shape[2])          # 逐通道查表，避免 lut[px] 广播成 (N,3,3)
-    for ch, color in ((CH_ROOT, (255, 0, 0)), (CH_STEM, (255, 165, 0))):
+    # show=None 画全部；给了集合就只画集合里的标签（--show root 时只画根）
+    for label, ch, color in (("root", CH_ROOT, (255, 0, 0)),
+                             ("stem", CH_STEM, (255, 165, 0))):
+        if show is not None and label not in show:
+            continue
         m = masks[ch]
         if m is not None and m.any():
             out[m] = _blend_lut(color, alpha)[out[m], cols]
-    if check_box is not None:
+    if check_box is not None and (show is None or "check_background" in show):
         h, w = out.shape[:2]
         im = Image.fromarray(out)
         ImageDraw.Draw(im).rectangle(
@@ -168,7 +226,7 @@ def make_overlay(img: np.ndarray, masks, check_box, alpha: float = 0.45) -> np.n
 
 
 def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
-                gpu_lock, tile=0):
+                gpu_lock, tile=0, show=None, root_shape="both"):
     """处理一张图：预测 → 统计 → 写 overlay/json；返回 (CSV 行, 控制台文本)。
 
     **并发安全**：只有 GPU 那一小段用 gpu_lock 串行 —— 单张图的 GPU 活本来就少
@@ -222,7 +280,7 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
     #   PNG 用 compress_level=1 —— 535ms（快 3.5 倍，代价是体积 19→32MB）；
     #   --overlay-jpg 改 JPEG q90/4:4:4 —— 40ms（快 47 倍、体积 2.3MB）。
     #     overlay 是给人看的，JPEG 画质足够；要无损再留 PNG。
-    ov = make_overlay(img, masks, res["check_box"])
+    ov = make_overlay(img, masks, res["check_box"], show=show)
     ov_path = out_dir / f"{p.stem}_overlay.{overlay_fmt}"
     if overlay_fmt == "jpg":
         Image.fromarray(ov).save(ov_path, quality=90, subsampling=0)
@@ -239,21 +297,42 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
     # 那条链路现在没人用了，而每次推理多写一份是实打实的开销。
     # `common/rsml_export.py` 仍留着（无调用点），要恢复只需在这里再调一次 write_rsml。
     saved = [ov_path.name]
+    # 2026-10-06：写哪些形状由 --show / --root-shape 决定 ——
+    #   root：折线（骨架中心线，统计口径）与/或多边形（掩码轮廓，可在 labelme 里
+    #         改成标注直接用）；stem：掩码轮廓；check_background：矩形。
+    # 同名 root 的两种形状并存是**有意**的：解析侧有「有 root 多边形就忽略 root 折线」
+    # 的规则（common/labelme.py），不会把一根数成两根。
+    want_root = "root" in show
+    polylines = st["paths"] if (want_root and root_shape in ("both", "line")) else ()
+    root_polys = mask_to_polygons(res["mask_counted"]) \
+        if (want_root and root_shape in ("both", "polygon")) else ()
+    stem_polys = mask_to_polygons(masks[CH_STEM]) \
+        if ("stem" in show and len(masks) > CH_STEM and masks[CH_STEM] is not None) else ()
+    check_box = res["check_box"] if (res["check_ok"] and "check_background" in show) else None
     write_labelme_json(out_dir / f"{p.stem}.json",
                        image_height=img.shape[0], image_width=img.shape[1],
-                       polylines=st["paths"], image_path=p.name,
-                       check_box=res["check_box"] if res["check_ok"] else None)
+                       polylines=polylines, root_polygons=root_polys,
+                       stem_polygons=stem_polys, image_path=p.name,
+                       check_box=check_box)
     saved.append(".json")
     if save_mask:
         saved.append(f"{p.stem}_mask.png")
+    n_shapes = (f"折线 {len(polylines)} + 根多边形 {len(root_polys)}"
+                + (f" + 茎多边形 {len(stem_polys)}" if stem_polys else "")
+                + (" + 检查框" if check_box is not None else ""))
     return row, (f"{p.name}: 根数 {count} | 总长 {total:.1f} px | 根面积 {root_area} px² | "
                  f"各根长 {len_str[:60]}{'…' if len(len_str) > 60 else ''}\n"
-                 f"    检查范围 {'已识别' if res['check_ok'] else '未识别(全图统计)'} | 已保存: "
-                 + " + ".join(saved))
+                 f"    检查范围 {'已识别' if res['check_ok'] else '未识别(全图统计)'} | "
+                 f"json: {n_shapes} | 已保存: " + " + ".join(saved))
 
 
 def main():
-    model_arg, folder_arg, mm_arg, size_arg, save_mask, overlay_fmt, jobs = parse_argv()
+    (model_arg, folder_arg, mm_arg, size_arg, save_mask, overlay_fmt, jobs,
+     show_arg, root_shape) = parse_argv()
+    if root_shape not in _ROOT_SHAPES:
+        sys.exit(f"[错误] --root-shape 只能是 {'/'.join(_ROOT_SHAPES)}，"
+                 f"当前 {root_shape!r}")
+    show = parse_show(show_arg)
     if not folder_arg:
         print(__doc__)
         sys.exit(1)
@@ -325,7 +404,8 @@ def main():
 
     def work(i):
         return process_one(imgs[i], model, size, device, out_dir, mm,
-                           overlay_fmt, save_mask, gpu_lock, tile=tile)
+                           overlay_fmt, save_mask, gpu_lock, tile=tile,
+                           show=show, root_shape=root_shape)
 
     if jobs == 1:
         for k in range(len(imgs)):

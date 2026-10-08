@@ -28,6 +28,10 @@
     # 加载器支持新格式之后：断言 73 组全都走 json
     python check_convert.py --dir "datasets\\root\\train" --dir "datasets\\root\\test" --provenance
 
+    # 注意：本工具只认**单一** label，现在只服务 root_model 的数据集。
+    # plant_model 的折线分 shoot（茎）/leaf（叶）两类、加载器也不是 load_annot，
+    # 那边用 plant_model\\tool\\check_lines（2026-10-05 起）。
+
 为什么自己读文件、不走项目的加载代码：
     `common/dataset.py` 的加载器正是被验证的对象之一。拿它来算「转换前」，
     等于用被测对象给自己出题。所以这里只借三样**不受本次改动影响**的东西：
@@ -74,6 +78,9 @@ def parse_args(argv=None):
                         "rsml=一律读 .rsml（只有 json 的样本会因此读不出根系）")
     p.add_argument("--capture", default=None, help="把逐样本指纹写到这个 json")
     p.add_argument("--compare", default=None, help="与之前抓的指纹比对")
+    p.add_argument("--label", default=ROOT_LABEL,
+                   help=f"json 里折线的 label（默认 {ROOT_LABEL!r}；"
+                        f"plant_model 数据集用 --label plant）")
     p.add_argument("--no-mask", action="store_true",
                    help="跳过掩码哈希（快得多；坐标逐位相同则掩码必然相同）")
     p.add_argument("--provenance", action="store_true",
@@ -116,12 +123,12 @@ def roots_from_rsml(path):
             for r in parse_rsml(path) if len(r.points) >= 2]
 
 
-def roots_from_json(path):
-    """新格式：shapes 里 label=="root" 的折线。<2 点丢弃，与 rsml_parse.py:52 同口径。"""
+def roots_from_json(path, label=ROOT_LABEL):
+    """新格式：shapes 里 label==label 的折线。<2 点丢弃，与 rsml_parse.py:52 同口径。"""
     data = json.loads(read_raw(path))
     out = []
     for s in data.get("shapes") or []:
-        if (s.get("label") or "").strip() != ROOT_LABEL:
+        if (s.get("label") or "").strip() != label:
             continue
         try:
             pts = [(float(p[0]), float(p[1])) for p in s.get("points") or []]
@@ -157,7 +164,7 @@ def mask_hash(polys, size):
     return hashlib.sha256(np.packbits(m).tobytes()).hexdigest(), int(m.sum())
 
 
-def fingerprint(json_path: Path, roots_from, no_mask):
+def fingerprint(json_path: Path, roots_from, no_mask, label=ROOT_LABEL):
     """返回一个样本的指纹 dict。读不了就给 {"error": ...}。"""
     stem = json_path.stem
     rsml, img = siblings(json_path, stem)
@@ -171,8 +178,8 @@ def fingerprint(json_path: Path, roots_from, no_mask):
         k = (s.get("label") or "").strip() or "(空)"
         census[k] = census.get(k, 0) + 1
 
-    if roots_from == "auto" and census.get(ROOT_LABEL):
-        polys, src = roots_from_json(json_path), "json"
+    if roots_from == "auto" and census.get(label):
+        polys, src = roots_from_json(json_path, label), "json"
     elif rsml is not None:
         polys, src = roots_from_rsml(rsml), "rsml"
     elif roots_from == "auto":
@@ -193,10 +200,10 @@ def fingerprint(json_path: Path, roots_from, no_mask):
         "n_points": len(flat),
         "coords_sha256": coords_hash(polys),
         "head": [[round(x, 4), round(y, 4)] for x, y in flat[:3]],
-        # root 那一类**故意**要从 0 变成 N，所以不能参与「相等」比较。
+        # 折线那一类（root/plant）**故意**要从 0 变成 N，所以不能参与「相等」比较。
         # 剩下的 stem / check 计数必须一字不变。
-        "n_shapes": {k: v for k, v in census.items() if k != ROOT_LABEL},
-        "n_root_shapes": census.get(ROOT_LABEL, 0),
+        "n_shapes": {k: v for k, v in census.items() if k != label},
+        "n_root_shapes": census.get(label, 0),
         "top_keys": list(data.keys()),
         "json_dims": [data.get("imageWidth"), data.get("imageHeight")],
         # 完整体折线留一份：比对时用它定位「第一处不同是哪个点」，
@@ -219,7 +226,7 @@ def collect(args):
             sys.exit(f"[错误] 文件夹不存在: {root}")
         files = sorted(root.rglob("*.json") if args.recursive else root.glob("*.json"))
         for f in files:
-            ent = fingerprint(f, args.roots_from, args.no_mask)
+            ent = fingerprint(f, args.roots_from, args.no_mask, args.label)
             if f.stem in man:
                 print(f"[警告] 名字重复，后者覆盖前者: {f}")
             ent["rel"] = (str(f.parent.relative_to(root) / f.name)
@@ -362,6 +369,9 @@ def check_provenance(args):
 
 
 def main():
+    # 同 merge_annot：GBK 控制台打印 ❌/✅ 会 UnicodeEncodeError，允许替换字符
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     args = parse_args()
     if not (args.capture or args.compare or args.provenance):
         sys.exit("要指定 --capture / --compare / --provenance 至少一个（用法见文件头）")

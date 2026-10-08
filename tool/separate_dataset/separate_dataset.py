@@ -47,7 +47,12 @@ DEFAULT_TRAIN = 0.8
 DEFAULT_TEST = 0.2
 
 # 顺手的垃圾文件，不参与划分
-JUNK_FILES = {".ds_store", "thumbs.db", "desktop.ini"}
+JUNK_FILES = {".ds_store", "thumbs.db", "desktop.ini", ".gitkeep"}
+
+# 像素级掩码的子目录（标注工具 create_datasets/root 写的，见 annotate_io.MASK_SUBDIR）。
+# 它在子目录里，所以 collect_groups 看不见它 —— 得单独搬，否则划分完训练就退回
+# 多边形口径，和没划分的数据成了两把尺子。
+MASK_SUBDIR = "masks"
 
 
 def parse_args(argv=None):
@@ -316,6 +321,7 @@ def main(argv=None):
             continue  # 不分配的子集不建空文件夹
         dst = out_dir / name
         dst.mkdir(parents=True, exist_ok=True)
+        n_mask = 0
         for gname in assign[name]:
             for path in groups[gname]:
                 sub = dest_subdir(path) if args.nested else ""
@@ -325,6 +331,22 @@ def main(argv=None):
                     shutil.move(str(path), str(target))
                 else:
                     shutil.copy2(str(path), str(target))
+            # 像素级掩码（标注工具写的 `masks/<名>.png`）**每个组搬一次**：
+            # 它在子目录里，按"组"是分不到它的（collect_groups 只看顶层文件），
+            # 不搬的话划分完训练就退回多边形口径了 —— 两批数据两个尺子。
+            # **放在内层循环外面**：一个组有图 + json 两个文件，放里面会搬两遍
+            # （结果一样，但计数翻倍）。
+            mp = src / MASK_SUBDIR / f"{Path(gname).stem}.png"
+            if mp.exists():
+                mt = dst / MASK_SUBDIR / mp.name
+                mt.parent.mkdir(parents=True, exist_ok=True)
+                if args.move:
+                    shutil.move(str(mp), str(mt))
+                else:
+                    shutil.copy2(str(mp), str(mt))
+                n_mask += 1
+        if n_mask:
+            print(f"  {name}：另搬了 {n_mask} 个像素级掩码（{MASK_SUBDIR}/）")
     write_record(out_dir, src, ratios, args.seed, assign)
 
     action = "移动" if args.move else "复制"

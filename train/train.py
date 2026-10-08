@@ -192,8 +192,16 @@ def split_by_plant(names, val_size, seed):
     """按植株分组划分：返回 (训练名列表, 验证名列表, 验证植株列表)。
 
     同一植株的所有时点整组进同一侧，避免「同株不同时点」跨训练/验证造成泄漏。
-    val_size = 验证集植株数；config.VAL_PLANTS 非空时优先按它钉死。
+    val_size = 验证集植株数；config.VAL_PLANTS 非空时优先按它钉死 ——
+    **但换数据集（如新标的一批）时一个都钉不上，这时退回随机划分**：否则验证集是空的，
+    训练会「不早停、保存最后轮」，等于没有验证（2026-10-06 在「多变形标注」数据集上踩到）。
     """
+    def _random_val(ks):
+        rng = np.random.RandomState(seed)
+        rng.shuffle(ks)
+        n = min(max(val_size, 0), max(len(ks) - 1, 0))   # **至少给训练留 1 株**
+        return sorted(ks[:n])
+
     groups = {}
     for n in names:
         groups.setdefault(plant_key(n), []).append(n)
@@ -203,11 +211,14 @@ def split_by_plant(names, val_size, seed):
         missing = sorted(set(config.VAL_PLANTS) - set(pinned))
         if missing:
             print(f"[警告] config.VAL_PLANTS 里的植株不在数据集中: {missing}")
-        val_plants = pinned
+        if pinned:
+            val_plants = pinned
+        else:
+            val_plants = _random_val(keys)
+            print(f"[警告] VAL_PLANTS 一个都没对上（换了数据集？）→ 退回随机划分 "
+                  f"{len(val_plants)} 植株: {val_plants}")
     else:
-        rng = np.random.RandomState(seed)
-        rng.shuffle(keys)
-        val_plants = sorted(keys[:max(val_size, 0)])
+        val_plants = _random_val(keys)
     val_set = set(val_plants)
     val_names = sorted(n for k in val_plants for n in groups[k])
     train_names = sorted(n for k, v in groups.items() if k not in val_set for n in v)

@@ -24,10 +24,15 @@
     定位 `"shapes"` 用的是**字符串感知的扫描器**而不是正则：正则应排不掉
     「字符串里的」和「嵌套对象里的」同名键（base64 的 imageData 就是现成的反例）。
 
+折线的 label 默认 `root`（root_model 的数据集），`--label` 可改 ——
+plant_model 数据集里这批折线其实是茎与叶（1.1 是茎，1.1.x 是叶），标的是
+`shoot`（茎）/ `leaf`（叶）—— 用 `--label shoot --branch-label leaf` 一次到位。
+
 用法：
     python merge_annot.py --dir "D:\\数据集总表\\root" -r --dry-run    # 先预览
     python merge_annot.py --dir "D:\\数据集总表\\root" -r --backup "D:\\_backup"
     python merge_annot.py --dir "D:\\数据集\\train\\labels\\other"     # 项目布局，零参数可用
+    python merge_annot.py --dir "..\\plant_model\\datasets\\plant\\train" --label shoot --branch-label leaf
 
 **改动前请先 --dry-run 预览一遍。** 这是就地改文件的有损操作。
 
@@ -39,6 +44,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -51,8 +57,11 @@ from common.rsml_parse import parse_rsml  # noqa: E402
 
 LOG_NAME = "merge_annot_log.txt"
 
-ROOT_LABEL = "root"
+DEFAULT_LABEL = "root"          # root_model 的默认；plant_model 用 --label shoot --branch-label leaf
 ROOT_SHAPE_TYPE = "linestrip"
+# 「主干」ID：`1.1` / `2.1` 这种深度 1 的条目（主根 / 幼苗的茎）。
+# 与两边项目里 dataset.py 的 `_PRIMARY_ID` 是同一个模式，别改成一个另一个不改。
+PRIMARY_ID = re.compile(r"^\d+\.1$")
 # labelme 单条形状的确切键序（照抄 6.x 的输出，多一个少一个都会和既有文件不一致）
 SHAPE_KEYS = ("label", "points", "group_id", "description",
               "shape_type", "flags", "mask")
@@ -79,7 +88,25 @@ def parse_args(argv=None):
                         "**必须在数据目录之外**，否则会被 separate_dataset 当数据卷进划分")
     p.add_argument("--only", default=None,
                    help="只处理主干名匹配这个通配符的文件（先用它转一个试试，再全量跑）")
+    p.add_argument("--label", default=DEFAULT_LABEL,
+                   help=f"插入折线的 label（默认 {DEFAULT_LABEL!r}；"
+                        f"plant_model 数据集用 shoot）")
+    p.add_argument("--branch-label", default=None,
+                   help="可选：把折线分两类标 —— ID 形如 \\d+.1 的（主根/茎）用 --label，"
+                        "其余（子根/叶）用这个 label。不给则全部用 --label")
     return p.parse_args(argv)
+
+
+def labels_for(roots, label, branch_label):
+    """逐条折线的 label（与 roots 同序）。
+
+    不带 --branch-label 时全部用 --label（root_model 的现状，逐字节不变）；
+    带了就按 ID 分：`\\d+.1`（主根/茎）用 --label，其余（子根/叶）用 --branch-label。
+    """
+    if branch_label is None:
+        return [label] * len(roots)
+    return [label if PRIMARY_ID.match(str(r.root_id)) else branch_label
+            for r in roots]
 
 
 def select(files, only):
@@ -200,11 +227,11 @@ def find_top_level_key(text: str, key: str):
 
 # ---------------------------------------------------------------- 渲染与插入
 
-def render_shape(points, indent: str, eol: str) -> str:
+def render_shape(points, indent: str, eol: str, label: str) -> str:
     """把一条折线渲染成 labelme 的单条形状（json.dumps(indent=2) 的排版**就是**
     labelme 的排版，整体平移缩进即可）。"""
     shape = {
-        "label": ROOT_LABEL,
+        "label": label,
         "points": [[float(x), float(y)] for x, y in points],
         "group_id": None,
         "description": "",
@@ -218,12 +245,17 @@ def render_shape(points, indent: str, eol: str) -> str:
     return textwrap.indent(s, indent)
 
 
-def build_insert(text: str, span, polylines):
-    """返回 (新文本, 插入段的 [起, 止])。插入段抠掉后必须与原文逐字节相同。"""
+def build_insert(text: str, span, polylines, labels):
+    """返回 (新文本, 插入段的 [起, 止])。插入段抠掉后必须与原文逐字节相同。
+
+    labels 与 polylines 同序（不是单个字符串 —— 逐条折线可以有不同的 label）。
+    """
+    if len(labels) != len(polylines):
+        raise ValueError(f"label 数与折线数不等：{len(labels)} vs {len(polylines)}")
     val_start, val_end, col = span
     eol = "\r\n" if "\r\n" in text else "\n"
     indent = " " * (col + 2)
-    elems = [render_shape(p, indent, eol) for p in polylines]
+    elems = [render_shape(p, indent, eol, lb) for p, lb in zip(polylines, labels)]
     joined = ("," + eol).join(elems)
 
     if text[val_start] != "[":
@@ -248,7 +280,7 @@ def build_insert(text: str, span, polylines):
 
 # ---------------------------------------------------------------- 写前自检
 
-def verify(old_text: str, new_text: str, span, polylines):
+def verify(old_text: str, new_text: str, span, polylines, labels):
     """自检不通过就抛异常，绝不写盘。
 
     最强的一条是**文本级**的：抠掉插入段后与原文逐字节相同 —— 它一次性覆盖了
@@ -277,11 +309,12 @@ def verify(old_text: str, new_text: str, span, polylines):
             raise ValueError(f"顶层键 {k!r} 的值被改动了")
 
     inserted = new["shapes"][n:]
-    for s in inserted:
+    for lb, s in zip(labels, inserted):
         if tuple(s.keys()) != SHAPE_KEYS:
             raise ValueError(f"插入项的键不对：{list(s.keys())}")
-        if s["label"] != ROOT_LABEL or s["shape_type"] != ROOT_SHAPE_TYPE:
-            raise ValueError("插入项的 label/shape_type 不对")
+        if s["label"] != lb or s["shape_type"] != ROOT_SHAPE_TYPE:
+            raise ValueError(f"插入项的 label 不对：期望 {lb!r}，实际 {s['label']!r}"
+                             f"（shape_type {s['shape_type']!r}）")
         if len(s["points"]) < 2:
             raise ValueError("插入项点数少于 2")
         # 浮点必须逐位相同：float → json.dumps → 文本 → json.loads 是精确往返
@@ -289,7 +322,7 @@ def verify(old_text: str, new_text: str, span, polylines):
             raise ValueError("坐标不是精确的浮点数")
 
     got = [[tuple(p) for p in s["points"]] for s in inserted]
-    want = [[tuple(p) for p in r.points] for r in polylines]
+    want = [[tuple(p) for p in pts] for pts in polylines]
     if got != want:
         raise ValueError("回读的坐标与 rsml 解析结果不逐位相等")
     return len(inserted)
@@ -329,7 +362,8 @@ def format_ok(text: str) -> str:
     return ""
 
 
-def merge_one(json_path: Path, rsml_dir, dry_run: bool, backup_dir):
+def merge_one(json_path: Path, rsml_dir, dry_run: bool, backup_dir,
+              label: str, branch_label=None):
     """返回 (状态, 详情行列表, 附加信息)。状态见 main() 的统计口径。"""
     try:
         text = read_text(json_path)
@@ -347,10 +381,13 @@ def merge_one(json_path: Path, rsml_dir, dry_run: bool, backup_dir):
     data = json.loads(text)
     if span[2] != 2:
         return "缩进不是 2 空格（跳过）", [f"键在第 {span[2]} 列"], {}
-    n_root = sum(1 for s in data.get("shapes") or [] if s.get("label") == ROOT_LABEL)
-    if n_root:
-        # 幂等：已经并过了。抽出来的图片/C 里那 2 个就走这条。
-        return "已有 root 标注（跳过）", [f"已有 {n_root} 条"], {}
+    # 幂等：任一目标 label 已出现就认为并过了。**不能只数 --label** ——
+    # 只有 leaf、shoot 被手删的 json 会被误判成「没并过」而重复插入整批折线。
+    targets = {label} | ({branch_label} if branch_label else set())
+    n_have = sum(1 for s in data.get("shapes") or [] if s.get("label") in targets)
+    if n_have:
+        # 抽出来的图片/C 里那 2 个就走这条。
+        return f"已有 {'/'.join(sorted(targets))} 标注（跳过）", [f"已有 {n_have} 条"], {}
 
     rsml = sibling_rsml(json_path, rsml_dir)
     if not rsml.exists():
@@ -360,14 +397,20 @@ def merge_one(json_path: Path, rsml_dir, dry_run: bool, backup_dir):
         roots = parse_rsml(rsml)
     except Exception as e:                       # noqa: BLE001 —— XML 各种坏法都归这里
         return "rsml 解析失败（跳过）", [str(e)], {}
-    polys = [r.points for r in roots if len(r.points) >= 2]
+    roots = [r for r in roots if len(r.points) >= 2]
+    polys = [r.points for r in roots]
     if not polys:
         # 合法的「这张图没有根」负样本（plant_S003-3 就是），不是错误
         return "rsml 无根（跳过）", [], {}
+    labels = labels_for(roots, label, branch_label)
+    if branch_label and label not in labels:
+        # --branch-label 的意义就是把「主根/茎」单独标出来；一条都没匹配上
+        # 说明这批 rsml 的 ID 不是 \d+.1 的形状，继续并只会把茎也标成 leaf。
+        return "rsml 里没有 ID 形如 N.1 的条目（跳过）", [], {}
 
     try:
-        new_text, new_span = build_insert(text, span, polys)
-        verify(text, new_text, new_span, roots)
+        new_text, new_span = build_insert(text, span, polys, labels)
+        verify(text, new_text, new_span, polys, labels)
     except (ValueError, AssertionError) as e:
         return "自检未通过（未改）", [str(e)], {}
 
@@ -377,6 +420,8 @@ def merge_one(json_path: Path, rsml_dir, dry_run: bool, backup_dir):
             "n_poly": len(polys), "n_pts": n_pts,
             "grew": len(new_text) - len(text)}
     detail = [f"插入 {len(polys)} 条 / {n_pts} 点 / +{meta['grew']} 字节",
+              f"label: {label}×{labels.count(label)}"
+              + (f" + {branch_label}×{labels.count(branch_label)}" if branch_label else ""),
               f"首条 {len(polys[0])} 点，首点 ({x0:.1f}, {y0:.1f})"]
 
     if not dry_run:
@@ -393,6 +438,10 @@ def merge_one(json_path: Path, rsml_dir, dry_run: bool, backup_dir):
 # ---------------------------------------------------------------- 主流程
 
 def main():
+    # Windows 控制台多半是 GBK，而正式跑要打印 ✓ —— 不换成替换字符会 UnicodeEncodeError
+    # 把工具打断（2026-10-04 在 plant 数据集上实际踩到，且崩在写盘之后的打印上）。
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     args = parse_args()
     root = Path(args.dir).resolve()
     if not root.is_dir():
@@ -415,13 +464,16 @@ def main():
                  + ("" if args.recursive else "（子文件夹里的没算，要递归请加 -r）"))
 
     print(f"目标: {root}（{'递归' if args.recursive else '只看本层'}"
-          + (f"；--only {args.only}" if args.only else "") + "）")
+          + (f"；--only {args.only}" if args.only else "")
+          + f"；label={args.label}"
+          + (f" + {args.branch_label}" if args.branch_label else "") + "）")
     print(f"找到 {len(files)} 个 .json"
           + ("   [dry-run：不改任何文件]\n" if args.dry_run else "\n"))
 
     stat, changed = {}, []
     for f in files:
-        status, detail, meta = merge_one(f, rsml_dir, args.dry_run, backup_dir)
+        status, detail, meta = merge_one(f, rsml_dir, args.dry_run, backup_dir,
+                                         args.label, args.branch_label)
         stat[status] = stat.get(status, 0) + 1
         if status == "已合并":
             changed.append((f, meta))

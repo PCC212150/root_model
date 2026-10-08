@@ -7,8 +7,9 @@
 
 输出：三类通道（根系 / 茎横截面 / 检查范围）各自的 IoU / Dice / 像素准确率 / clDice /
 连通块，根系另加两个补充口径（**容差 Dice**：几像素的边界滑移不算错；**滞回口径 Dice**：
-部署统计总长实际用的那张掩码），以及每张图「预测根数/总长 vs RSML 真值」的对比与
-平均绝对误差。口径细节见 common/metrics.py 与 CSV 末尾的 # 行。
+部署统计总长实际用的那张掩码），以及每张图「预测根数/总长/面积 vs RSML 真值」的对比、
+平均绝对误差，和**预测 vs 真值的相关系数 R（长度、面积各一个）**—— MAE 量绝对误差，
+R 量「模型有没有追踪植株间的差异」。口径细节见 common/metrics.py 与 CSV 末尾的 # 行。
 结果保存至模型文件夹内 model_test_{年月日时分}.csv（UTF-8 BOM，Excel 可直接打开；
 文件末尾是若干以 # 开头的汇总行）。
 """
@@ -116,16 +117,22 @@ def main():
     rows = []
     agg = {k: [] for k in ("gt_roots", "pred_roots", "gt_total", "gt_total_raw",
                            "pred_total", "gt_cont",
-                           "root_tol2", "root_tol4", "root_hyst")}
+                           "root_tol2", "root_tol4", "root_hyst",
+                           "gt_area", "pred_area")}
     per_ch_metrics = {n: {"iou": [], "dice": [], "accuracy": [], "cldice": [],
                           "ncomp": []} for n in names}
     t_start = time.time()
     n_legacy = 0
+    n_poly = 0
     for name, img_path, _annot_path in pairs:
         img = image_io.load_rgb(img_path)
         h0, w0 = img.shape[:2]
         annot = load_annot(args.data_dir, name, (w0, h0))
         n_legacy += annot.source == "rsml"
+        # 多边形标注的图（2026-10-06 起支持）：root 通道按**真实轮廓填充**画，
+        # 「GT总长-标注」会变成**轮廓周长**（不是根长）——下面集中告警一次。
+        n_poly += bool(getattr(annot.lab, "root_polygons", None)
+                       and any(annot.lab.root_polygons))
         roots = annot.roots
         gt_count, gt_lens, gt_total_raw = root_stats(roots)
         # 标注质量标记：交叉处断开重画的「续接片段」有多少条。
@@ -195,6 +202,10 @@ def main():
         agg["root_tol2"].append(dice_tol2)
         agg["root_tol4"].append(dice_tol4)
         agg["root_hyst"].append(dice_hyst)
+        # 相关系数用的原始量：根系面积（GT 侧 = 真值根掩码 ∩ 检查框；预测侧 = mask_counted
+        # —— 和「总长」用的是同一张统计掩码，两侧口径一致；也是推理 CSV 的「总根系面积」）
+        agg["gt_area"].append(float(gt[CH_ROOT].sum()))
+        agg["pred_area"].append(float(res["mask_counted"].sum()))
         for m in ms:
             for k in ("iou", "dice", "accuracy", "cldice", "ncomp"):
                 per_ch_metrics[m["name"]][k].append(m[k])
@@ -215,7 +226,8 @@ def main():
                 f"{gt_total_raw:.1f}", f"{gt_total:.1f}", f"{pred_total:.1f}", len_str]
         if mm and mm > 0:
             row += [f"{gt_total * mm:.1f}", f"{pred_total * mm:.1f}"]
-        row += [f"{dice_tol2:.4f}", f"{dice_tol4:.4f}", f"{dice_hyst:.4f}"]
+        row += [f"{dice_tol2:.4f}", f"{dice_tol4:.4f}", f"{dice_hyst:.4f}",
+                f"{agg['gt_area'][-1]:.0f}", f"{agg['pred_area'][-1]:.0f}"]
         rows.append(row)
 
         parts = []
@@ -241,6 +253,23 @@ def main():
     def mae(a, b):
         return float(np.abs(np.asarray(agg[a]) - np.asarray(agg[b])).mean())
 
+    def corr(a, b):
+        """预测值(b) 对 真值(a) 的 Pearson R 与回归斜率。
+
+        为什么除 MAE 之外还要看 R：**MAE 量的是绝对误差，R 量的是「模型有没有追踪植株间的
+        差异」** —— 做处理间对比时，后者才是关键。R 高但斜率明显 <1，说明排序对了、
+        但系统性偏小（两列要一起读）。样本 <3 或某一列没有波动时返回 (nan, nan)。
+        """
+        x = np.asarray(agg[a], dtype=float)
+        y = np.asarray(agg[b], dtype=float)
+        if len(x) < 3 or x.std() < 1e-9 or y.std() < 1e-9:
+            return float("nan"), float("nan")
+        return (float(np.corrcoef(x, y)[0, 1]),
+                float(np.polyfit(x, y, 1)[0]))
+
+    r_len, k_len = corr("gt_total", "pred_total")
+    r_ar, k_ar = corr("gt_area", "pred_area")
+
     header = ["图片名"]
     for n in names:
         header += [f"IoU({n})", f"Dice({n})", f"像素准确率({n})",
@@ -250,7 +279,8 @@ def main():
                "预测各根长(px,降序,至多30条)"]
     if mm and mm > 0:
         header += ["GT总长(mm)", "预测总长(mm)"]
-    header += ["Dice(root)@2px容差", "Dice(root)@4px容差", "Dice(root)滞回口径"]
+    header += ["Dice(root)@2px容差", "Dice(root)@4px容差", "Dice(root)滞回口径",
+               "GT根系面积(px²)", "预测根系面积(px²)"]
 
     summary = [
         "",
@@ -319,9 +349,19 @@ def main():
         f"#   部署（滞回）口径 Dice {avg('root_hyst'):.4f} —— 统计总长用的那张 mask_counted"
         f"（低阈值 {config.PRED_LOW_THRESHOLD} + 检查范围求交），比上面 0.5 阈值那张胖，"
         f"两张不是同一张图；",
+        f"# 相关性（{len(pairs)} 张）：长度 R={r_len:.3f}（斜率 {k_len:.2f}）| "
+        f"面积 R={r_ar:.3f}（斜率 {k_ar:.2f}）—— 预测 vs 真值。R 量「模型有没有追踪"
+        f"植株间的差异」（做处理间对比时比 MAE 更关键）；**R 高但斜率 <1 = 排序对、但系统性偏小**，"
+        f"两个要一起读。面积用的是统计掩码（GT 根∩检查框 / 预测 mask_counted）；",
         f"# 单位换算：1 px = {mm} mm" if mm else "# 未做 mm 换算",
         f"# 测试总耗时 {el:.1f}s | 单图平均 {el / max(len(pairs), 1):.2f}s",
     ]
+    if n_poly:
+        summary.append(
+            f"# ⚠️ 本批 {n_poly}/{len(pairs)} 张是**多边形标注**：root 通道按真实轮廓"
+            f"**填充**画（不是 {mask_width:g}px 中心线）—— ① 像素指标与折线标注的批次"
+            f"**不可比**（前景宽度不同）；② 「GT总长-标注」= 多边形**周长**、不是根长，"
+            f"该列请忽略，总长以「GT总长-理想」（掩码→骨架口径）为准；③ 根数不受影响")
 
     # create_unique_file 而非 unique_path：两个测试进程同时启动时（一张卡一个），
     # 「先查存在、再 open(w)」会双双选中同一个文件名，**静默覆盖**对方的结果
@@ -354,6 +394,11 @@ def main():
           + f" | 总长平均绝对误差 {mae('gt_total', 'pred_total'):.0f} px "
             f"（vs 理想掩码；vs 原始标注 "
             f"{mae('gt_total_raw', 'pred_total'):.0f} px）")
+    print(f"相关性 R（预测 vs 真值）: 长度 {r_len:.3f}（斜率 {k_len:.2f}）| "
+          f"面积 {r_ar:.3f}（斜率 {k_ar:.2f}）")
+    if n_poly:
+        print(f"[注意] 本批 {n_poly}/{len(pairs)} 张是多边形标注：像素指标按"
+              f"填充轮廓算（与折线标注不可比），「GT总长-标注」是周长、不是根长")
     print(f"测试总耗时 {el:.1f}s")
     print(f"结果已保存: {csv_path}")
 

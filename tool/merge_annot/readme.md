@@ -1,7 +1,11 @@
 # 把 rsml 的根系折线并进 labelme json
 
 标注格式统一：**一个 labelme json 装三个通道**。本工具把 `<名>.rsml` 里的根系折线，
-作为 `label: "root"` + `shape_type: "linestrip"` 追加到同名 json 的 `shapes` 数组。
+作为 `shape_type: "linestrip"` 追加到同名 json 的 `shapes` 数组（label 默认 `root`）。
+
+用 `--branch-label` 还能把折线**分两类标**：ID 形如 `\d+.1` 的（主根/茎）用 `--label`，
+其余（子根/叶）用 `--branch-label`。plant_model 数据集就是这么标的：
+`--label shoot --branch-label leaf`（`shoot`=茎=1.1，`leaf`=叶=1.1.x）。
 
 ```
 改前  C001-1.json   [check_background, stem]                     +  C001-1.rsml
@@ -50,6 +54,8 @@ python tool\merge_annot\merge_annot.py --dir "D:\数据集\train\labels\other"  
 | `-r` / `--recursive` | 递归子文件夹 |
 | `--rsml-dir` | 显式指定 rsml 目录，覆盖自动推断 |
 | `--only` | 只处理主干名匹配通配符的文件；**全量跑之前先用它转一个核对** |
+| `--label` | 插入折线的 label，默认 `root`；plant 数据集用 `shoot` |
+| `--branch-label` | 可选。给了就按 ID 分两类：`\d+.1`（主根/茎）用 `--label`，其余用这个 label |
 | `--backup DIR` | 改前把原 json 按相对路径拷到 DIR。**必须在数据目录之外**（否则会被 `separate_dataset` 当数据卷进划分） |
 | `--dry-run` | 只打印将要插入的内容，不写文件 |
 
@@ -57,8 +63,9 @@ python tool\merge_annot\merge_annot.py --dir "D:\数据集\train\labels\other"  
 
 | 情况 | 处理 |
 | --- | --- |
-| json 里已有 root 形状 | ✅ 跳过（**幂等**，重跑零改动） |
+| json 里已有任一目标 label 的形状 | ✅ 跳过（**幂等**，重跑零改动）。**按任一 label 判**，不能只数 `--label` —— 只有 leaf、shoot 被手删的 json 会被误判成没并过而重复插入 |
 | rsml 有 0 条根 | ✅ 跳过。这是**合法的「这张图没有根」负样本**，不是错误 |
+| 带 `--branch-label` 但一条 `\d+.1` 都没有 | ❌ 跳过。继续并只会把主根/茎也标成分支 label |
 | 找不到同名 rsml | ✅ 跳过，只统计不刷屏（未标注的图很多） |
 | 只有 rsml、没有 json | ⚠️ **只报告，跳过**。不发明标注文件 |
 | 有 BOM / 换行混用 / 不是合法 json | ❌ 拒绝改（**不猜**） |
@@ -112,3 +119,11 @@ python tool\check_convert\check_convert.py --dir "D:\目标文件夹" -r --compa
 跑完用 `check_convert` 核对：**75 组逐项相同**（折线数 / 点数 / 坐标哈希 /
 原图分辨率掩码哈希 / 图片与 json 尺寸 / 顶层键与键序 / stem 与 check 的条数），
 74 组如期从 rsml 翻到 json。重跑一次幂等，零字节改动。
+
+### 2026-10-05，plant_model 数据集（20 组）改标 shoot / leaf
+
+先 `--label plant` 全量合并过一次（20 组 / 109 条折线），随后为了把茎(1.1)和
+叶(1.1.x)分开，从合并前的备份恢复后改用 `--label shoot --branch-label leaf` 重并：
+`shoot×1 + leaf×N`，坐标与 rsml 逐位相同。plant 侧的核对工具是
+[plant_model/tool/check_lines](../../../plant_model/tool/check_lines/readme.md)
+（`check_convert` 只认单一 label，plant 数据不再用它）。

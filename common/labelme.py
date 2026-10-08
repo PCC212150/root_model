@@ -28,9 +28,12 @@ from pathlib import Path
 STEM_LABEL = "stem"
 CHECK_LABEL = "check_background"
 ROOT_LABEL = "root"
-# labelme 里画折线用 linestrip；line / polygon 也接住 —— 都是「一串点连起来」，
+# labelme 里画折线用 linestrip；line 也接住 —— 都是「一串点连起来」，
 # 与 rsml 的 <point> 序列语义相同，没必要因为画图工具的选择不同就丢掉标注。
+# **polygon 是另一回事**（2026-10-06 起）：它表示"根的**真实轮廓**"，掩码要按
+# **填充**画（见 dataset.build_target_masks），不是描一条 10px 宽的线。
 ROOT_SHAPE_TYPES = ("linestrip", "line", "polygon")
+ROOT_FILLED_TYPES = ("polygon",)
 
 
 @dataclass
@@ -41,6 +44,7 @@ class OtherLabels:
     stems: list = field(default_factory=list)       # [[(x, y), ...], ...] 茎多边形
     check_rect: tuple = None                        # (x0, y0, x1, y1) 检查范围外接矩形
     roots: list = field(default_factory=list)       # [[(x, y), ...], ...] 根系折线（>=2 点）
+    root_polygons: list = field(default_factory=list)  # 与 roots 逐条对应：True=轮廓多边形(填充)
     info: dict = field(default_factory=dict)        # 自检信息（shape 数 / 面积占比 / 告警）
 
     @property
@@ -102,6 +106,7 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
 
     shapes = data.get("shapes") or []
     labels_seen = []
+    root_lines, root_polys = [], []      # root 的两种形状先分开收，循环后再定（见下）
     for s in shapes:
         label = (s.get("label") or "").strip()
         labels_seen.append(label)
@@ -113,10 +118,10 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
             # 与 rsml_parse.py:52 同口径：少于 2 个点无法构成折线，丢弃。
             # 两格式必须一致，否则同一份标注换个格式就会算出不同的掩码。
             if len(pts) >= 2:
-                lab.roots.append(pts)
                 st = (s.get("shape_type") or "").strip()
                 if st not in ROOT_SHAPE_TYPES:
                     warns.append(f"root 的 shape_type={st!r} 不是折线，已按折线读取")
+                (root_polys if st in ROOT_FILLED_TYPES else root_lines).append(pts)
             else:
                 warns.append(f"root 只有 {len(pts)} 个点，忽略")
         elif label == STEM_LABEL:
@@ -135,6 +140,19 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
             lab.check_rect = box if lab.check_rect is None else _union(lab.check_rect, box)
         else:
             warns.append(f"未知 label {label!r}，已忽略")
+
+    # root 的两种形状**同名并存**时的取舍（2026-10-06，配合 labelme_export 的导出）：
+    # 多边形是"真实轮廓"（权威），折线只是它的中心线 —— 两个都收会把一根数成两根，
+    # 直接污染根数与掩码。所以**有多边形就只用多边形**（老的折线数据集没有多边形，不受影响）。
+    if root_polys:
+        if root_lines:
+            warns.append(f"root 同时有 {len(root_polys)} 个多边形和 {len(root_lines)} 条折线："
+                         f"**只取多边形**（折线是多边形的中心线，两个都算会重复计根）")
+        lab.roots = root_polys
+        lab.root_polygons = [True] * len(root_polys)
+    else:
+        lab.roots = root_lines
+        lab.root_polygons = [False] * len(root_lines)
 
     lab.info = {
         "n_shapes": len(shapes),

@@ -120,12 +120,18 @@ def discover_pairs(data_dir, image_exts=None) -> list:
     return pairs
 
 
+# 像素级掩码的子目录名。**必须和 create_datasets/root/annotate_io.py 里的
+# MASK_SUBDIR 一致** —— 标注工具往那儿写，这里读。
+MASK_SUBDIR = "masks"
+
+
 @dataclass
 class Annot:
     """一个样本的全部标注。`roots` 的来源见 `source`。"""
 
     stem: str
     orig_size: tuple = None                 # (w0, h0) 磁盘上图片的实际尺寸
+    data_dir: object = None                 # 数据集目录（找 masks/<名>.png 用）
     roots: list = field(default_factory=list)   # list[Root]（json/rsml 两条路产出同型对象）
     lab: OtherLabels = None                 # 茎 / 检查范围（没有 json 时是空壳）
     source: str = "json"                    # "json"=新格式 | "rsml"=旧格式（会大声告警）
@@ -172,16 +178,16 @@ def load_annot(data_dir, stem, orig_size=None, verbose=True) -> Annot:
            if json_path is not None else OtherLabels(path=None, info={}))
 
     if lab.roots:
-        return Annot(stem, orig_size, [Root(points=p) for p in lab.roots], lab,
-                     "json", json_path, rsml_path)
+        return Annot(stem, orig_size, data_dir, [Root(points=p) for p in lab.roots],
+                     lab, "json", json_path, rsml_path)
     if rsml_path is not None:
         roots = parse_rsml(rsml_path)
         if verbose:
             _warn_legacy(stem, json_path, rsml_path, len(roots))
-        return Annot(stem, orig_size, roots, lab, "rsml", json_path, rsml_path)
+        return Annot(stem, orig_size, data_dir, roots, lab, "rsml", json_path, rsml_path)
     # 有 json 但没有 root 折线、也没有 rsml：照常当「这张图没有根」的负样本，
     # 由 _warn_empty_root 去提醒（它可能是合法的负样本，也可能是漏标）。
-    return Annot(stem, orig_size, [], lab, "json", json_path, None)
+    return Annot(stem, orig_size, data_dir, [], lab, "json", json_path, None)
 
 
 def plant_key(name: str) -> str:
@@ -272,6 +278,34 @@ def _warn_empty_root(annot):
           f"那种情况下会把模型教坏。")
 
 
+def load_root_mask_png(annot, target_size):
+    """读标注工具存的**像素级 root 掩码**（`<data_dir>/masks/<名>.png`，黑底白条）。
+
+    返回 bool (h1, w1)；没有这个文件就返回 None（调用方保留多边形那条路的结果）。
+
+    只提供 **root**：茎和检查框本来就是模型预测的、人没动过，继续走 json 那条路。
+    root 是人一笔笔改出来的，值得逐像素保真 —— 比"把多边形在目标分辨率上重新栅格化"
+    准在两点：少了轮廓近似的量化损失；也不会有"漏画折线的根被当成背景"这种假负样本
+    （实测这批图 root 面积 +1.6%）。
+
+    **缩放口径**：原图 -> 目标尺度用**面积平均再取过半**（PIL BOX + `>127`），不是最近邻
+    —— 5472 缩到 1024 时根只有约 1.9px 宽，最近邻会把细根整段抽没。
+    """
+    from PIL import Image
+    if getattr(annot, "data_dir", None) is None:
+        return None
+    p = Path(annot.data_dir) / MASK_SUBDIR / f"{annot.stem}.png"
+    if not p.exists():
+        return None
+    with Image.open(p) as im:
+        arr = np.asarray(im.convert("L"), dtype=np.uint8)
+    w1, h1 = int(target_size[0]), int(target_size[1])
+    if (arr.shape[1], arr.shape[0]) != (w1, h1):
+        arr = np.asarray(Image.fromarray(arr).resize((w1, h1), Image.BOX),
+                         dtype=np.uint8)
+    return arr > 127
+
+
 def build_target_masks(annot, target_size, mask_width):
     """画三通道真值掩码，返回 (masks[h,w,3] bool, chan_valid[3] float)。
 
@@ -289,9 +323,25 @@ def build_target_masks(annot, target_size, mask_width):
     valid = np.zeros(3, dtype=np.float32)
 
     line_w = gt_mask.target_line_width(mask_width, orig_size, target_size)
-    polys = [gt_mask.scale_points(r.points, orig_size, target_size)
-             for r in annot.roots if len(r.points) >= 2]
-    masks[:, :, CH_ROOT] = gt_mask.draw_polylines_at(polys, target_size, line_w)
+    # root 两种画法，**逐条判断、可以混用**（2026-10-06 起支持多边形轮廓）：
+    #   polygon （新）→ **填充**：根的看得见轮廓，宽度是标注时量出来的真实宽度；
+    #   linestrip/line（老）→ 描一条 mask_width 宽的线（10px@原图尺度）。
+    # 这两套是**两把尺子**（前景宽度不同 → Dice/IoU/面积不可跨口径比），
+    # 但根数、骨架总长的口径不变。
+    flags = getattr(annot.lab, "root_polygons", None) or []
+    line_pts, fill_pts = [], []
+    for i, r in enumerate(annot.roots):
+        if len(r.points) < 2:
+            continue
+        pts = gt_mask.scale_points(r.points, orig_size, target_size)
+        if i < len(flags) and flags[i] and len(pts) >= 3:
+            fill_pts.append(pts)
+        else:
+            line_pts.append(pts)
+    if line_pts:
+        masks[:, :, CH_ROOT] = gt_mask.draw_polylines_at(line_pts, target_size, line_w)
+    if fill_pts:
+        masks[:, :, CH_ROOT] |= gt_mask.draw_polygons_at(fill_pts, target_size)
 
     # 根系标注是配对前提，但**文件存在 ≠ 里面画了东西**：RSMLGenerator 里没标就保存会留下
     # 一个没有 <geometry> 的空壳（如 560 字节、0 个控制点）；新格式下则是一个
@@ -300,8 +350,7 @@ def build_target_masks(annot, target_size, mask_width):
     # plant_S003-3_20251116ST 就是真·没有根的合法样本，用户确认过。
     # 但仍要告警一次：它也可能是「忘记画就保存」的漏标，那种情况下会把模型教坏，得让人看见。
     valid[CH_ROOT] = 1.0
-    if not masks[:, :, CH_ROOT].any():
-        _warn_empty_root(annot)
+    # 空 root 的告警挪到最后统一发（下面可能被像素级掩码覆盖，那时以掩码为准）
 
     lab = annot.lab
     if lab.stems:
@@ -318,6 +367,18 @@ def build_target_masks(annot, target_size, mask_width):
         valid[CH_CHECK] = 1.0
     if valid[CH_CHECK] == 0:                   # 没有检查框：不限制统计范围
         masks[:, :, CH_CHECK] = True
+
+    # **最后一步：如果有像素级 root 掩码，用它替换 root 通道**（茎/检查框保持上面
+    # 多边形那条路的结果 —— 它们本来就是模型预测的，人没动过）。
+    # 放在最后覆盖，是为了让"有没有掩码"只影响 root 一个通道，别的逻辑一行都不用分叉。
+    # ⚠️ 掩码和多边形是**两把尺子**（实测 root 面积差约 1.6%）：同一批数据要么都有
+    #    掩码、要么都没有，混着用等于一半图一个口径。
+    root_px = load_root_mask_png(annot, target_size)
+    if root_px is not None:
+        masks[:, :, CH_ROOT] = root_px
+        valid[CH_ROOT] = 1.0
+    if not masks[:, :, CH_ROOT].any():
+        _warn_empty_root(annot)
     return masks, valid
 
 
