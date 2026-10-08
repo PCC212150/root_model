@@ -165,9 +165,14 @@ def _reduce_val_metric(arrs, ddp):
     a = np.asarray(arrs, dtype=np.float64)
     s = np.nansum(a, axis=0)
     c = np.sum(~np.isnan(a), axis=0)
-    t = torch.from_numpy(np.stack([s, c]))          # (2, C)
+    # **张量必须和通信后端在同一个设备上**：NCCL 只做 GPU 张量，喂 CPU 张量会直接
+    # 报 "No backend type associated with device type cpu"（2026-10-08 在服务器上
+    # 第一次跑 NCCL 才暴露 —— 本机验证用的是 gloo，而 gloo 恰好能算 CPU，所以一直没踩到）。
+    dev = (torch.device("cuda", torch.cuda.current_device())
+           if ddp.backend == "nccl" else torch.device("cpu"))
+    t = torch.from_numpy(np.stack([s, c])).to(dev)  # (2, C)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    s, c = t[0].numpy(), t[1].numpy()
+    s, c = t[0].cpu().numpy(), t[1].cpu().numpy()
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.where(c > 0, s / np.maximum(c, 1.0), np.nan)
 
@@ -372,7 +377,9 @@ def main():
               f"×{args.src_weight}")
 
     # ---- 模型 ----
-    if args.norm == "batch" and args.batch < 2:
+    if args.norm == "batch" and args.batch < 2 and not ddp.enabled:
+        # DDP 下不适用：下面会把 BatchNorm 换成 SyncBatchNorm，统计量跨卡算
+        # （每卡 1 张 × 3 卡 = 3 张），不是 config.NORM 里说的那种单卡 batch=1
         print(f"[警告] 归一化用 BatchNorm 但 batch={args.batch}：batch=1 时读到的统计量"
               f"与推理用的滑动平均对不上，会出现严重欠分割。请用 batch≥2 或把 "
               f"config.NORM 改成 'group'。")
@@ -394,7 +401,8 @@ def main():
     # "module." 前缀，存出来的 ckpt 用 ckpt.load_unet 加载会直接报键不匹配。
     raw_model = model.module if hasattr(model, "module") else model
     n_params = sum(p.numel() for p in raw_model.parameters())
-    eff_batch = args.batch * args.accum
+    # 等效 batch 要把**卡数**算进去（DDP 下 --batch 是每张卡的）
+    eff_batch = args.batch * args.accum * (ddp.world if ddp.enabled else 1)
     print(f"U-Net 参数量: {n_params / 1e6:.2f}M | "
           + (f"切片训练 块 {args.crop}×{args.crop}（原图不缩放）"
              if args.crop else f"整图缩放到长边 {args.size}")

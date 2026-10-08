@@ -149,18 +149,25 @@ class Dist:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return tensor
 
+    def _dev(self):
+        """集合通信用哪个设备：NCCL 必须给 GPU，gloo 给 CPU（见 _reduce_val_metric 的注释）。"""
+        import torch
+        if self.backend == "nccl":
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
     def broadcast_object(self, obj, src=0):
         if not self.enabled:
             return obj
         import torch.distributed as dist
         box = [obj]
-        dist.broadcast_object_list(box, src=src)
+        dist.broadcast_object_list(box, src=src, device=self._dev())
         return box[0]
 
     def barrier(self):
         import torch.distributed as dist
         if self.enabled:
-            dist.barrier()
+            dist.barrier(device_ids=[self.local_rank] if self.backend == "nccl" else None)
 
     @property
     def is_main(self):
