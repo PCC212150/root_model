@@ -26,6 +26,8 @@ CSV 里**同时有 C 和 P 时，每种处理方式各画一套**（5 个编号 
     python tool\\analysis_datas\\analysis_datas.py                          # 用 analysis_datas/ 下所有 csv
     python tool\\analysis_datas\\analysis_datas.py --csv x.csv --compare C,P
     python tool\\analysis_datas\\analysis_datas.py --csv x.csv --compare C,S --ids 001,002,003
+    python tool\\analysis_datas\\analysis_datas.py --csv x.csv --compare C,P --reps 1,3
+                                    # --reps：每个编号只画第 1、3 次重复（C001-1/C001-3）
 
 输出：analysis_datas/{csv文件名}/，内含两张一套的折线图 + `_总览.png` + `_汇总.csv`
       （+ 原 CSV 里有带空格的图片名时，另存一份 `{原名}_无空格.csv`）。
@@ -111,6 +113,9 @@ def parse_args(argv=None):
                         "把同一编号下的两种处理画进同一张图（8 条线）")
     p.add_argument("--ids", default=None,
                    help="只画这些编号，逗号分隔（如 001,002）；默认全画")
+    p.add_argument("--reps", default=None,
+                   help="只画这些重复次序（图片名 C001-1 里的 1），逗号分隔（如 1,3）；"
+                        "写 -1,-3 也认；默认全画")
     p.add_argument("--x-cat", action="store_true",
                    help="横坐标按日期**等距**排，而不是按真实时间间隔。"
                         "对比不同批次时必须要（如 C 是 2024-12、S 是 2025-11，隔了近一年，"
@@ -415,6 +420,9 @@ def main():
             sys.exit(f"[错误] 找不到 CSV: {c}")
 
     want = {s.strip() for s in str(args.ids).split(",")} if args.ids else None
+    # 重复次序过滤（--reps 1,3）。两种写法都收：`1,3` 和 `-1,-3`（图片名里那种带横杠的）。
+    want_reps = ({s.strip().lstrip("-") for s in str(args.reps).split(",")}
+                 if args.reps else None)
     compare = None
     if args.compare:
         compare = [s.strip() for s in str(args.compare).split(",") if s.strip()]
@@ -442,6 +450,14 @@ def main():
 
     for label, data, stats in jobs:
         all_reps = sorted({r for _, _, r in data}, key=lambda x: (len(x), x))
+        if want_reps is not None:
+            kept = [r for r in all_reps if r in want_reps]
+            if not kept:
+                # 一个都对不上就明说，别画出一堆"每个编号 0 张图"的空目录
+                print(f"[跳过] {label}: --reps {args.reps!r} 和数据里的重复次序对不上"
+                      f"（数据里是 {all_reps}）\n")
+                continue
+            all_reps = kept
         kinds = sorted({k for k, _, _ in data})
         nums = sorted({n for _, n, _ in data})
         if want:

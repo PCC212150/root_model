@@ -78,11 +78,16 @@ python tool\analysis_datas\analysis_datas.py --csv "C:\Users\me\Desktop\root_pic
 python tool\analysis_datas\analysis_datas.py --csv a.csv,b.csv          # 多个文件
 python tool\analysis_datas\analysis_datas.py                            # 用 analysis_datas\ 下所有 csv
 python tool\analysis_datas\analysis_datas.py --csv x.csv --ids 001,002       # 只画这几个编号
+python tool\analysis_datas\analysis_datas.py --csv x.csv --reps 1,3         # 只画第 1、3 次重复
 python tool\analysis_datas\analysis_datas.py --csv x.csv --compare C,P      # C/P 叠进同一张图
 python tool\analysis_datas\analysis_datas.py --csv C.csv,P.csv --compare C,P --x-cat
                                                                         # 两个 CSV 会先合并再比
 python tool\analysis_datas\analysis_datas.py --csv x.csv --no-overview      # 不生成总览图
 ```
+
+> **在 PowerShell 里跑的话，逗号分隔的参数要加引号**：`--ids "001,003"`、`--reps "1,3"`。
+> PS 会把裸的 `001,003` 当数字列表求值 —— **前导零丢掉**（实际传成 `1,3`，编号一个都
+> 匹配不上还不报错）；`001,,003`（多打一个逗号）则直接语法错误。cmd 里没有这个问题。
 
 重跑到同一个 `--out` 时不会覆盖旧图：输出目录会追加 `-1`、`-2`（项目规范），
 旧目录要自己删。
@@ -93,6 +98,7 @@ python tool\analysis_datas\analysis_datas.py --csv x.csv --no-overview      # �
 | `--out` | 输出根目录，默认 `analysis_datas\`（每个 csv 在其中各建一个同名文件夹） |
 | `--compare` | 对比模式：给两种处理方式（如 `C,P`），同一编号画进一张图（8 条线） |
 | `--ids` | 只画这些编号，逗号分隔 |
+| `--reps` | 只画这些**重复次序**（图片名 `C001-1` 里的 `1`），逗号分隔（如 `1,3`，写 `-1,-3` 也认）；默认全画 |
 | `--x-cat` | 横坐标按日期**等距**排（对比不同批次时必须要） |
 | `--dpi` | 单图分辨率，默认 150 |
 | `--keep-bad` | 保留 `check_ok` / `root_ok` = 否 的点 |
