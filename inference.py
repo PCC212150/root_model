@@ -11,6 +11,8 @@
     python inference.py --dir D:\\...\\某图片文件夹 --overlay-jpg       # overlay 存 JPEG（快 47 倍）
     python inference.py --dir <文件夹> --jobs 4                       # 并发 4 张（吞吐约 2~3 倍）
     python inference.py --model model_a,model_b --dir ...              # 多模型集成
+    python inference.py --dir <文件夹> --gpu 2                        # 指定显卡（默认自动挑最空的）
+    python inference.py --dir <文件夹> --cpu                          # 强制 CPU（慢，验证流程用）
     python inference.py --dir <文件夹> --show root                    # 只画/只导 root
     python inference.py --dir <文件夹> --show root,stem               # overlay 只画这两类
     python inference.py --dir <文件夹> --root-shape polygon           # root 只出多边形（不出折线）
@@ -93,6 +95,8 @@ def parse_argv():
     jobs = 1
     show = None               # None/空 = 全部三标签（root + stem + check_background）
     root_shape = "both"       # root 的形状：both / line / polygon
+    cpu = False               # --cpu：强制 CPU
+    gpu = None                # --gpu N：指定哪张卡；None = 自动挑最空的
     tokens = sys.argv[1:]
     i = 0
     while i < len(tokens):
@@ -112,6 +116,16 @@ def parse_argv():
             # 并发处理张数：GPU 前向串行、CPU 部分并行。默认 1（与旧行为一致）
             jobs = int(tokens[i + 1]) if i + 1 < len(tokens) else 1
             i += 2
+        elif t == "--gpu":
+            # 指定显卡编号（readme「显式指定」一节：train/test/inference 都接）。
+            # 原样把 token 交给 device.pick —— 它内部 int() 并给出友好报错，
+            # 这里再解析一遍只会多一个难看的 ValueError。
+            gpu = tokens[i + 1] if i + 1 < len(tokens) else None
+            i += 2
+        elif t == "--cpu":
+            # 强制 CPU（本机无 CUDA 或只想验证流程时用）
+            cpu = True
+            i += 1
         elif t in ("--overlay-jpg", "--overlay-jpeg"):
             # overlay 存 JPEG（q90/4:4:4）：写一张快 47 倍、体积小 8 倍，画质对看结果够用
             overlay_fmt = "jpg"
@@ -148,7 +162,7 @@ def parse_argv():
                 sys.exit(1)
             i += 1
     return (model, folder, mm_per_px, size, save_mask, overlay_fmt, jobs,
-            show, root_shape)
+            show, root_shape, cpu, gpu)
 
 
 _BLEND_LUT = {}
@@ -328,7 +342,7 @@ def process_one(p, model, size, device, out_dir, mm, overlay_fmt, save_mask,
 
 def main():
     (model_arg, folder_arg, mm_arg, size_arg, save_mask, overlay_fmt, jobs,
-     show_arg, root_shape) = parse_argv()
+     show_arg, root_shape, cpu, gpu) = parse_argv()
     if root_shape not in _ROOT_SHAPES:
         sys.exit(f"[错误] --root-shape 只能是 {'/'.join(_ROOT_SHAPES)}，"
                  f"当前 {root_shape!r}")
@@ -347,8 +361,7 @@ def main():
 
     import torch
     # 自动挑当前最空的 GPU（不再写死 cuda:0 —— 服务器上 4 张卡常有人占着）
-    device = device_mod.pick(cpu=getattr(args, "cpu", False),
-                             gpu=getattr(args, "gpu", None))
+    device = device_mod.pick(cpu=cpu, gpu=gpu)
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
     meta = metas[0]
     # 切片训练的模型走**原始分辨率滑窗**（见 ckpt.infer_tile 的实测对比）；0 = 老路径

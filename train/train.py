@@ -23,6 +23,9 @@
 服务器上运行：
 CUDA_VISIBLE_DEVICES=0 python train.py --size  --batch  --workers 
 -1 则为cpu
+
+CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/train.py --size 2736 --batch 1 --accum 4 --workers 2 --src-weight 0.3 --epochs 2000
+
 """
 import argparse
 import contextlib
