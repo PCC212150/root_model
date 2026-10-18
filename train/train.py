@@ -40,11 +40,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[1] #获取当前文件所在目录的上两级目录路径:root_model
+sys.path.insert(0, str(PROJECT_ROOT))              #把项目根目录插到 Python 模块搜索路径最前面（索引 0），这样 `import` 时优先从这个目录找包，解决 模块导入找不到 问题
 
 import config  # noqa: E402
-from common import device as device_mod, naming  # noqa: E402
+from common import device as device_mod, naming  # noqa: E402     表示忽略 E402 错误，即允许在文件非顶部位置导入模块而不触发警告
 from common.dataset import RootDataset, plant_key  # noqa: E402
 from common.unet import UNet  # noqa: E402
 
@@ -56,7 +56,8 @@ def dice_loss(prob, target):
     eps = 1.0
     inter = (prob * target).sum(dim=(2, 3))
     den = prob.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-    return 1.0 - (2.0 * inter + eps) / (den + eps)
+    dice = (2.0 * inter + eps) / (den + eps)
+    return 1.0 - dice
 
 
 def _soft_erode(img):
@@ -68,10 +69,12 @@ def _soft_erode(img):
 
 
 def _soft_dilate(img):
+    # **软膨胀 soft dilate**：3×3 方形窗口最大池化，可微分，用来把概率图前景向外扩张
     return F.max_pool2d(img, (3, 3), (1, 1), (1, 1))
 
 
 def _soft_open(img):
+    # **软开运算 soft open：先软腐蚀，再软膨胀**，可微分形态学操作，用来**抹除细小虚假分支 / 孤立噪点，保留主体根系形状**。
     return _soft_dilate(_soft_erode(img))
 
 
@@ -554,6 +557,11 @@ def main():
                         cd, dg = cldice_loss(prob.float(), y, config.CLDICE_ITERS,
                                              cld_chans)
                         wc = channel_weights(config.LOSS_CLDICE_W, valid)[:, cld_chans]
+                        # 来源权重也要乘到 clDice 上（2026-10-18 补）：上面 BCE / Dice
+                        # 都已乘 sw，这里漏掉的话 `--src-weight 0.3` 对伪标签的折扣
+                        # 在拓扑项上完全失效 —— 一项按 0.3、一项按 1.0，等于没打对折。
+                        if sw is not None:
+                            wc = wc * sw
                         loss = loss + (cd * wc).sum() / wc.sum().clamp(min=1e-6)
                         # 统计只算非退化样本，否则退化的 0 会把均值拉低、掩盖问题
                         ok = ~dg
