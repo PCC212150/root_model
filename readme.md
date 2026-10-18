@@ -18,21 +18,19 @@
 
 ## 数据说明
 
-数据集位于 [datasets/root](datasets/root)，train / test 结构相同，**图片与标注分目录存放**：
+数据集位于 [datasets/root](datasets/root)，按**真值口径**分两个来源子目录（2026-10-08 起）：
 
 ```
-datasets/root/train/                  datasets/root/test/
-├── images/                           ├── images/
-│   ├── plant_ S062-1_20251116ST.png  │   └── …（png / jpg 可混用）
-│   └── …                             └── labels/
-└── labels/                               ├── roots/   # 根系 RSML（与图片同名）
-    ├── roots/                            └── other/   # 茎/检查范围（与图片同名）
-    └── other/
+datasets/root/train/GT/     <名>.jpg  <名>.json  masks/<名>.png   人工多边形 + 像素掩码 —— 真值
+datasets/root/train/scr/    <名>.jpg  <名>.json                   折线膨胀的 10px 带 —— 伪标签
+datasets/root/test/GT/      <名>.jpg  <名>.json  masks/<名>.png   测试集**只放 GT**
 ```
 
-**布局是扁平的**（2026-09-30 起）：`datasets/root/{train,test}/` 下图片与标注同层。
-`common/dataset.py` 也仍能读旧的嵌套布局（`images/` + `labels/roots` + `labels/other`），
-自动识别，不用手工搬。
+（test 下没有 scr —— 两种口径是**两把尺子**，混在一份里算出来的 Dice 没有意义。）
+
+**布局是扁平的**（2026-09-30 起）：来源子目录下图片与标注同层，每个来源子目录都是一份
+独立完整的数据集（`common/dataset.py` 的 `source_dirs`）。旧的嵌套布局
+（`images/` + `labels/roots` + `labels/other`）也仍能读，自动识别，不用手工搬。
 
 | 文件（以 `plant_ S062-1_20251116ST` 为例） | 内容 | 说明 |
 | --- | --- | --- |
@@ -49,12 +47,15 @@ datasets/root/train/                  datasets/root/test/
 约 1.9px 宽，最近邻会把细根整段抽没。
 
 > ⚠️ **两把尺子，同一批数据要么都有掩码、要么都没有**（混着用等于一半图一个口径）。
-> 划分数据集时 [tool/separate_dataset](tool/separate_dataset/separate_dataset.py) 会把
-> `masks/` 一起搬过去（它在子目录里，按"组"是分不到的）。
+> 装配/划分时 [tool/assemble_dataset](tool/assemble_dataset/readme.md)（本布局的主力）与
+> [tool/separate_dataset](tool/separate_dataset/separate_dataset.py) 都会把 `masks/`
+> 跟着组一起搬（它在子目录里，按"组"是分不到的）。
 
 `<名>.json` 里的三类 shape：
 
-- `root`（linestrip）：**根系折线**，每条根一段 —— 2026-09-30 从 `.rsml` 并进来的；
+- `root`（linestrip / **polygon**）：**根系折线**，每条根一段 —— 2026-09-30 从 `.rsml` 并进来的。
+  做过多边形轮廓标注的图（即 GT 组）里还多一份 `polygon` 的 root，那是根的**真实轮廓**；
+  两种同时存在时**只取多边形**（折线是它的中心线，都算会把一根数成两根）；
 - `stem`（polygon）：**甘蔗茎的横截面**（图中间那个褐色截面）；
 - `check_background`（rectangle）：**框选检查的范围**（托盘内框区域），根系统计只看框内。
 
@@ -62,20 +63,29 @@ datasets/root/train/                  datasets/root/test/
 > 并由 [tool/check_convert](tool/check_convert/readme.md) 逐组核对过
 > （折线数 / 点数 / 坐标哈希 / 掩码哈希 / 尺寸全等）。
 
-当前规模（**2026-09-17 重导**）：**train 29 组 / 21 个植株，test 7 组 / 7 个植株**，
-两边三类标注齐全。测试集按**植株整株划出**，与训练集**植株级零重叠** ——
-36 张图归并成 28 个植株（同一植株有多个时点），整株进同一侧。
+当前规模（**2026-10-15 重装**，源 88 组 / 51 株）：**train 77 组 / 51 株，test 11 组 / 4 株**。
 
-导入方式（源文件夹是扁平的，输出是上面的嵌套布局）：
+装配方式：
 
 ```
-python tool\separate_dataset\separate_dataset.py --dir "<源文件夹>" --out "%CD%\datasets\root" --test 0.25
+python tool\assemble_dataset\assemble_dataset.py --dir "C:\Users\21215\Desktop\数据集总表\root\新"
 ```
 
-划分记录见 `datasets/root/split.txt`（比例、种子、每组归属，可复现）。
-测试集 7 株：`S127-1 / S127-3 / S127-4 / S001-3 / S002-3 / S002-4 / C001-1`
-（其中 `C001-1` 是 2024-12 的 **CK 批次**，与其余 ST 批次不同源，等于顺带测了跨批次泛化）。
-早先的 31 张数据集与重复件备份已删除，`datasets/` 下现在只有 `root/` 这一份。
+它按「有多边形+掩码 -> GT，只有折线 -> scr」分类，scr **全部进 train**（测试集只放 GT），
+GT 按**单图**随机抽 1/3（种子 42）进 test。
+
+划分记录见 `datasets/root/split.txt`（口径、比例、种子、每组归属，可复现）；
+**前因后果与警告见 [config.py](config.py) 的「数据集划分记录」** —— `datasets/` 不入库，
+那份注释是划分的唯一出处。两条要紧的：
+
+> ⚠️ **test/GT 的 4 株（C019-1/2/3/4）在 train 里都有时点**：按单图抽的必然后果，
+> 是用户明确要的口径（项目平时的规矩是整株进出）。test/GT 的分数因此偏乐观，
+> 只能当「在准确尺子上看趋势」，**不能当泛化性能**。
+> ⚠️ **测试集换了**（老 test 是 C019-2 七组 + C019-4 七组），训练数据也从 43 组涨到 77 组
+> —— 与 10-13 之前的模型指标**一律不可比**。
+
+旧装配没删，都在 `datasets/` 下：`root_旧装配备份_2026-10-15/`（本次覆盖的那份）、
+`root_旧装配备份_2026-10-12/`（更早的 106 张装配）。
 
 **标注粒度不统一（2026-09-17 核对）：侧根有的图分开画、有的图并进主根一条折线。**
 36 组里 15 组含 `secondary`（侧根）标注、21 组只有 `primary`，**且不是按日期分的**

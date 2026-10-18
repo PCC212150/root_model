@@ -1,4 +1,8 @@
-"""命名辅助：时间戳名称 + 名称冲突去重（追加 -1、-2…，遵循项目规范）。"""
+"""命名辅助：时间戳名称 + 名称冲突去重（追加 -1、-2…）+ 植株识别（遵循项目规范）。
+
+**本模块不依赖 torch**（只用标准库）—— 划分/装配这类纯文件名操作的工具要能在
+没装 torch 的机器上跑（本地 Windows 就没装），所以别往这儿加 numpy/torch 依赖。
+"""
 from datetime import datetime
 from pathlib import Path
 
@@ -6,6 +10,29 @@ from pathlib import Path
 def timestamp(fmt: str = "%Y%m%d%H%M") -> str:
     """当前时间字符串，如 202609091135（年月日时分）。"""
     return datetime.now().strftime(fmt)
+
+
+def plant_key(name: str) -> str:
+    """图片名 -> 植株标识，用于「整株进出」的数据划分。
+
+    'plant_ S062-1_20251116ST' -> 'S062-1'
+    'root_C001-1_20241229CK'   -> 'C001-1'
+
+    **2026-10-15 从 common/dataset.py 搬来这里**：逻辑一行没改，只是 dataset.py 顶层
+    import torch，于是「按文件名判植株」这件纯字符串的事被绑上了 torch —— 本地没装
+    torch 的装配/划分工具就调不了它，只能各自抄一份正则（那正是两边规则漂移的老路）。
+    dataset.py 现在从这里 import 再导出，`from common.dataset import plant_key` 照常可用。
+    """
+    s = str(name).replace(" ", "")  #去掉空格
+    for pre in ("plant_", "root_"):
+        if s.startswith(pre):
+            s = s[len(pre):]
+            break
+    head, sep, tail = s.rpartition("_")
+    # 末段是「日期+批次」这类记号时去掉（如 20251116ST / 20241229CK）
+    if sep and len(tail) >= 6 and any(ch.isdigit() for ch in tail):
+        s = head
+    return s
 
 
 def unique_path(path) -> Path:

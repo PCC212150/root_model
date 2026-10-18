@@ -112,8 +112,10 @@ def parse_argv():
         elif t == "--save-mask":
             save_mask = True
             i += 1
-        elif t == "--jobs":
+        elif t in ("--jobs", "--job"):
             # 并发处理张数：GPU 前向串行、CPU 部分并行。默认 1（与旧行为一致）
+            # --job 是漏 s 的常见写法，2026-10-13 收作别名：以前它落到下面的
+            # 「别名兜底」分支、被当成图片文件夹，报错完全指不到真正的原因。
             jobs = int(tokens[i + 1]) if i + 1 < len(tokens) else 1
             i += 2
         elif t == "--gpu":
@@ -146,11 +148,24 @@ def parse_argv():
             model = t[2:]
             i += 1
         elif t.startswith("--"):
+            # readme 风格的宽松别名：含 model 的当模型，其余当图片文件夹。
+            # 兜底本身是好事，但**不能静默覆盖已经给过的值** —— 2026-10-13 有人把
+            # --jobs 打成 --job，这里就把 8 当成了文件夹、把前面给对的 --dir
+            # 覆盖掉，最后报「目标图片文件夹不存在: 8」，指不到真正的原因。
             key = t[2:].lstrip("-")
+            val = tokens[i + 1] if i + 1 < len(tokens) else None
             if "model" in key:
-                model = tokens[i + 1] if i + 1 < len(tokens) else None
+                if model is not None:
+                    sys.exit(f"[错误] {t} 不认识，按别名规则它要指定「模型」，"
+                             f"但模型已经给了 {model!r}（这次的值 {val!r}）——"
+                             f"看看是不是参数拼错了")
+                model = val
             else:
-                folder = tokens[i + 1] if i + 1 < len(tokens) else None
+                if folder is not None:
+                    sys.exit(f"[错误] {t} 不认识，按别名规则它要指定「图片文件夹」，"
+                             f"但文件夹已经给了 {folder!r}（这次的值 {val!r}）——"
+                             f"看看是不是参数拼错了（如 --jobs 漏了 s）")
+                folder = val
             i += 2
         else:
             if model is None:

@@ -40,6 +40,9 @@ from torch.utils.data import Dataset
 import config
 from common import gt_mask, image_io
 from common.labelme import OtherLabels, parse_other
+# plant_key 的实现搬去了 common/naming.py（那边不依赖 torch，装配/划分工具能在没装
+# torch 的机器上复用）；这里 import 再导出，`from common.dataset import plant_key` 照旧。
+from common.naming import plant_key  # noqa: F401
 from common.rsml_parse import Root, parse_rsml
 
 # 通道序号（与 config.CLASS_NAMES 一致）
@@ -257,24 +260,6 @@ def load_annot(data_dir, stem, orig_size=None, verbose=True) -> Annot:
     # 有 json 但没有 root 折线、也没有 rsml：照常当「这张图没有根」的负样本，
     # 由 _warn_empty_root 去提醒（它可能是合法的负样本，也可能是漏标）。
     return Annot(stem, orig_size, data_dir, [], lab, "json", json_path, None)
-
-
-def plant_key(name: str) -> str:
-    """图片名 -> 植株标识，用于「整株进出」的数据划分。
-
-    'plant_ S062-1_20251116ST' -> 'S062-1'
-    'root_C001-1_20241229CK'   -> 'C001-1'
-    """
-    s = str(name).replace(" ", "")
-    for pre in ("plant_", "root_"):
-        if s.startswith(pre):
-            s = s[len(pre):]
-            break
-    head, sep, tail = s.rpartition("_")
-    # 末段是「日期+批次」这类记号时去掉（如 20251116ST / 20241229CK）
-    if sep and len(tail) >= 6 and any(ch.isdigit() for ch in tail):
-        s = head
-    return s
 
 
 def _corner_fill(img: np.ndarray, patch: int = 32) -> tuple:
