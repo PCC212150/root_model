@@ -233,7 +233,9 @@ def parse_args():
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet", choices=("unet", "unet++"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
-                        "unet++=嵌套跳跃连接（2D，见 common/unet_plusplus.py）")
+                        "unet++=嵌套跳跃连接（2D，见 common/unet_plusplus.py）。"
+                        "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
+                        "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步")
     p.add_argument("--workers", type=int, default=config.NUM_WORKERS,
                    help="DataLoader 子进程数（0=主进程里同步加载）。服务器上设 4~8 可让"
                         "读图/增强与训练并行，避免 GPU 空等（默认见 config.NUM_WORKERS）")
