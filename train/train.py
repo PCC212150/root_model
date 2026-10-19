@@ -287,9 +287,6 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    # 输入尺寸固定（整图同一 size / 切片固定 crop）时，让 cudnn 自动选最快的卷积算法。
-    # 首轮有一次性的搜索开销；若以后改成每张图输入尺寸都不同，应关掉它。
-    torch.backends.cudnn.benchmark = True
 
     # 逐通道正样本权重：命令行优先，否则用 config。长度必须与 CLASS_NAMES 对齐，
     # 否则 pos_weight 会广播到错误的通道上（错得不明显，只是学得不对）。
