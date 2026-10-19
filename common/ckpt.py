@@ -11,6 +11,7 @@ import torch
 
 import config
 from common.unet import UNet
+from common.unet_plusplus import UNetPlusPlus
 
 # 当前流程要求的输出通道数（见 config.CLASS_NAMES：root / stem / check）
 REQUIRED_CHANNELS = 3
@@ -42,13 +43,21 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
 
     # 归一化类型必须与训练时一致（BatchNorm 与 GroupNorm 的参数形状不同，装错会加载失败）
     norm = ckpt.get("norm") or (ckpt.get("hparams") or {}).get("norm") or "batch"
-    model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
+    # 骨架：unet / unet++。旧权重没有 arch 字段 -> 默认 unet（向后兼容）
+    hp = ckpt.get("hparams") or {}
+    arch = ckpt.get("arch") or hp.get("arch") or "unet"
+    if arch == "unet++":
+        model = UNetPlusPlus(in_ch=3, out_ch=out_ch, norm=norm)
+    elif arch == "unet":
+        model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
+    else:
+        raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识（只支持 unet / unet++）")
     model.load_state_dict(sd)
     model.to(device)
-    hp = ckpt.get("hparams") or {}
     meta = {
         "out_ch": out_ch,
         "norm": norm,
+        "arch": arch,
         "epoch": ckpt.get("epoch"),
         "val_dice": ckpt.get("val_dice"),
         "class_names": ckpt.get("class_names"),
