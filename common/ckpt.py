@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 import config
+from common.attention_unet import AttentionUNet
 from common.unet import UNet
 from common.unet_plusplus import UNetPlusPlus
 
@@ -48,10 +49,13 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
     arch = ckpt.get("arch") or hp.get("arch") or "unet"
     if arch == "unet++":
         model = UNetPlusPlus(in_ch=3, out_ch=out_ch, norm=norm)
+    elif arch == "attention_unet":
+        model = AttentionUNet(in_ch=3, out_ch=out_ch, norm=norm)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
-        raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识（只支持 unet / unet++）")
+        raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
+                         f"（只支持 unet / unet++ / attention_unet）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {

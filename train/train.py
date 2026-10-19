@@ -46,6 +46,7 @@ sys.path.insert(0, str(PROJECT_ROOT))              #把项目根目录插到 Pyt
 import config  # noqa: E402
 from common import device as device_mod, naming  # noqa: E402     表示忽略 E402 错误，即允许在文件非顶部位置导入模块而不触发警告
 from common.dataset import RootDataset, plant_key  # noqa: E402
+from common.attention_unet import AttentionUNet  # noqa: E402
 from common.unet import UNet  # noqa: E402
 from common.unet_plusplus import UNetPlusPlus  # noqa: E402
 
@@ -231,11 +232,14 @@ def parse_args():
     p.add_argument("--norm", default=config.NORM, choices=("group", "batch"),
                    help="归一化层：group=GroupNorm（小 batch 稳定）、batch=BatchNorm"
                         "（需 batch≥2，默认见 config.NORM）")
-    p.add_argument("--arch", default="unet", choices=("unet", "unet++"),
+    p.add_argument("--arch", default="unet",
+                   choices=("unet", "unet++", "attention_unet"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
-                        "unet++=嵌套跳跃连接（2D，见 common/unet_plusplus.py）。"
+                        "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
+                        "attention_unet=注意力门控跳连（common/attention_unet.py）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
-                        "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步")
+                        "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
+                        "Attention U-Net 的显存与 U-Net 接近")
     p.add_argument("--workers", type=int, default=config.NUM_WORKERS,
                    help="DataLoader 子进程数（0=主进程里同步加载）。服务器上设 4~8 可让"
                         "读图/增强与训练并行，避免 GPU 空等（默认见 config.NUM_WORKERS）")
@@ -397,6 +401,8 @@ def main():
               f"config.NORM 改成 'group'。")
     if args.arch == "unet++":
         model = UNetPlusPlus(in_ch=3, out_ch=N_CH, norm=args.norm)
+    elif args.arch == "attention_unet":
+        model = AttentionUNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
