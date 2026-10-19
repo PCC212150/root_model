@@ -47,6 +47,7 @@ import config  # noqa: E402
 from common import device as device_mod, naming  # noqa: E402     表示忽略 E402 错误，即允许在文件非顶部位置导入模块而不触发警告
 from common.dataset import RootDataset, plant_key  # noqa: E402
 from common.unet import UNet  # noqa: E402
+from common.unet_plusplus import UNetPlusPlus  # noqa: E402
 
 N_CH = len(config.CLASS_NAMES)
 
@@ -230,6 +231,9 @@ def parse_args():
     p.add_argument("--norm", default=config.NORM, choices=("group", "batch"),
                    help="归一化层：group=GroupNorm（小 batch 稳定）、batch=BatchNorm"
                         "（需 batch≥2，默认见 config.NORM）")
+    p.add_argument("--arch", default="unet", choices=("unet", "unet++"),
+                   help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
+                        "unet++=嵌套跳跃连接（2D，见 common/unet_plusplus.py）")
     p.add_argument("--workers", type=int, default=config.NUM_WORKERS,
                    help="DataLoader 子进程数（0=主进程里同步加载）。服务器上设 4~8 可让"
                         "读图/增强与训练并行，避免 GPU 空等（默认见 config.NUM_WORKERS）")
@@ -389,7 +393,10 @@ def main():
         print(f"[警告] 归一化用 BatchNorm 但 batch={args.batch}：batch=1 时读到的统计量"
               f"与推理用的滑动平均对不上，会出现严重欠分割。请用 batch≥2 或把 "
               f"config.NORM 改成 'group'。")
-    model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
+    if args.arch == "unet++":
+        model = UNetPlusPlus(in_ch=3, out_ch=N_CH, norm=args.norm)
+    else:
+        model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
     # "SyncBatchNorm layers only work with GPU modules"
     if ddp.enabled and args.norm == "batch" and device.type == "cuda":
@@ -409,7 +416,7 @@ def main():
     n_params = sum(p.numel() for p in raw_model.parameters())
     # 等效 batch 要把**卡数**算进去（DDP 下 --batch 是每张卡的）
     eff_batch = args.batch * args.accum * (ddp.world if ddp.enabled else 1)
-    print(f"U-Net 参数量: {n_params / 1e6:.2f}M | "
+    print(f"{args.arch} 参数量: {n_params / 1e6:.2f}M | "
           + (f"切片训练 块 {args.crop}×{args.crop}（原图不缩放）"
              if args.crop else f"整图缩放到长边 {args.size}")
           + f" | batch {args.batch}" + (f"×累积{args.accum}={eff_batch}"
@@ -677,6 +684,7 @@ def main():
                                 "val_dice": val_dice, "select_dice": select_dice,
                                 "stem_dice": stem_dice, "hparams": hparams,
                                 "out_ch": N_CH, "norm": args.norm,
+                                "arch": args.arch,
                                 "class_names": list(config.CLASS_NAMES)},
                                ckpt_path)
                 bad_epochs = 0
@@ -726,6 +734,7 @@ def main():
                         "stem_dice": per_ch_dice[1] if N_CH > 1 else -1.0,
                         "hparams": hparams,
                         "out_ch": N_CH, "norm": args.norm,
+                        "arch": args.arch,
                         "class_names": list(config.CLASS_NAMES)},
                        ckpt_path)
     finally:
