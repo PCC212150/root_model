@@ -1,8 +1,15 @@
-# Swin-Unet 预训练编码器
+# 预训练权重
+
+| 模型 | 文件 | 大小 | 用途 |
+| --- | --- | --- | --- |
+| Swin-Unet | `swin_tiny_patch4_window7_224.pth` | 114342173 B | `--arch swin_unet` 默认加载（ImageNet-1K Swin-T） |
+| TransUNet | `R50+ViT-B_16.npz` | 461217452 B | `--arch transunet` 默认加载（ImageNet-21k R50+ViT-B/16） |
+
+`*.pth` / `*.npz` 均已被 `.gitignore` 忽略，权重文件不入库；新环境需要单独下载/拷贝。
+
+## Swin-Unet 编码器
 
 `--arch swin_unet` 默认加载这里的 ImageNet Swin-T 编码器权重。
-
-## 文件
 
 | 文件 | 大小 | md5 |
 | --- | --- | --- |
@@ -26,3 +33,16 @@ GitHub 不通时走已有的代理，或在能上网的机器下好后拷到服�
 - 编码器参数没有 100% 命中会直接报错，不会静默地从零训练。
 
 `*.pth` 已被 `.gitignore` 忽略，权重文件不入库；新环境需要单独下载/拷贝。
+
+## TransUNet R50-ViT-B_16
+
+`R50+ViT-B_16.npz`，461217452 B，md5 `fb93b71c850df1b0390448d4bafc4262`。
+
+```bash
+curl -L -o R50+ViT-B_16.npz \
+  https://storage.googleapis.com/vit_models/imagenet21k/R50+ViT-B_16.npz
+```
+
+加载时位置编码会从 14×14 双线性插值到训练网格（如 64×96），
+并自动处理 cls token；ViT 与 ResNetV2 的键名和官方 `load_from` 一致。
+`--transunet-pretrained none` 可关闭（从零训练）。

@@ -30,6 +30,13 @@ SWIN_PRETRAINED_URL = ("https://github.com/SwinTransformer/storage/releases/"
                        "download/v1.0.0/swin_tiny_patch4_window7_224.pth")
 # 本地已校验（2026-10-20）：114342173 字节，md5 34f0d33ced06751da78d8e7149b5f11a
 
+# TransUNet 的 R50-ViT-B_16 预训练权重（461MB，ImageNet-21k）。
+# Google Storage 官方地址；国内访问不了时在能上网的机器下好拷到 pretrained_ckpt/。
+# http://storage.googleapis.com/vit_models/imagenet21k/R50+ViT-B_16.npz
+TRANSUNET_PRETRAINED_CKPT = PRETRAINED_DIR / "R50+ViT-B_16.npz"
+TRANSUNET_PRETRAINED_URL = ("https://storage.googleapis.com/vit_models/"
+                            "imagenet21k/R50+ViT-B_16.npz")
+
 # ========================= 数据集划分记录 =========================
 # **`datasets/` 不入库，所以这份记录是划分的唯一出处。改数据必须回来改这里。**
 #

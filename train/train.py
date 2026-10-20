@@ -234,7 +234,7 @@ def parse_args():
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet",
                    choices=("unet", "unet++", "attention_unet", "swin_unet",
-                            "segformer"),
+                            "segformer", "transunet"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
@@ -242,7 +242,10 @@ def parse_args():
                         "固定输入尺寸、不支持 --crop、需要 timm/einops；默认加载 "
                         "ImageNet Swin-T 编码器，--swin-pretrained none 关闭）；"
                         "segformer=MiT 编码器 + 轻量解码头（common/segformer.py，"
-                        "全卷积、无固定输入尺寸；默认 b2，--segformer-variant 可选 b0~b5）。"
+                        "全卷积、无固定输入尺寸；默认 b2，--segformer-variant 可选 b0~b5）；"
+                        "transunet=R50-ViT-B_16 + DecoderCup（common/transunet.py，"
+                        "固定输入尺寸、不支持 --crop、默认开梯度检查点；"
+                        "默认加载 ImageNet-21k 预训练，--transunet-pretrained none 关闭）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
@@ -253,6 +256,14 @@ def parse_args():
     p.add_argument("--segformer-pretrained", default="none",
                    help="SegFormer 官方 mmseg 预训练权重的路径；none=从零训练（默认）。"
                         "支持 backbone.* / 裸 MiT 键名；只对 --arch segformer 生效")
+    p.add_argument("--transunet-pretrained",
+                   default=str(config.TRANSUNET_PRETRAINED_CKPT),
+                   help="TransUNet 的 R50+ViT-B_16.npz 预训练权重路径（默认见 "
+                        "config.TRANSUNET_PRETRAINED_CKPT）；none=从零训练。"
+                        "只对 --arch transunet 生效；相对路径按项目根目录解析")
+    p.add_argument("--transunet-no-checkpoint", action="store_true",
+                   help="关闭 TransUNet ViT 的梯度检查点：更快，但 1024x1536 下"
+                        "12 层、6144 token 的注意力激活很可能在 24GB 上 OOM")
     p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
                    help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
                         "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
@@ -409,24 +420,27 @@ def main():
         print(f"[来源权重] GT {n_gt} 组 ×1.0 | 其余 {len(src_w_lut) - n_gt} 组 "
               f"×{args.src_weight}")
 
-    # ---- Swin-Unet 的固定输入尺寸 ----
-    # Swin 不是全卷积模型（PatchEmbed 里有 assert），必须按训练时的精确 (H, W)
-    # 实例化；因此不接受 --crop（切片训练/滑窗验证会换尺寸）。
+    # ---- 固定输入尺寸的骨架（Swin-Unet / TransUNet）----
+    # 两者都不是全卷积模型（Swin 的 PatchEmbed 有 assert；TransUNet 的位置编码和
+    # DecoderCup 网格在构造时固定），必须按训练时的精确 (H, W) 实例化；
+    # 因此不接受 --crop（切片训练/滑窗验证会换尺寸）。
     arch_img_size = None
-    if args.arch == "swin_unet":
+    if args.arch in ("swin_unet", "transunet"):
         if args.crop:
-            sys.exit("[错误] Swin-Unet 是固定尺寸模型，不支持 --crop 切片训练/滑窗验证")
+            sys.exit(f"[错误] {args.arch} 是固定尺寸模型，"
+                     f"不支持 --crop 切片训练/滑窗验证")
         h1, w1 = train_ds.items[0]["img"].shape[:2]
         arch_img_size = (int(h1), int(w1))
-        if h1 % 32 or w1 % 32:
-            sys.exit(f"[错误] Swin-Unet 要求输入 H/W 能被 32 整除"
-                     f"（4 次 patch merging），--size {args.size} 得到 "
-                     f"{h1}×{w1}；请换一个 --size（如 768、1536）")
+        stride_req = 32 if args.arch == "swin_unet" else 16
+        if h1 % stride_req or w1 % stride_req:
+            sys.exit(f"[错误] {args.arch} 要求输入 H/W 能被 {stride_req} 整除，"
+                     f"--size {args.size} 得到 {h1}×{w1}；请换一个 --size"
+                     f"（如 768、1536）")
         for it in train_ds.items:
             if it["img"].shape[:2] != (h1, w1):
-                sys.exit(f"[错误] Swin-Unet 要求所有输入同尺寸：{it['name']} 是 "
+                sys.exit(f"[错误] {args.arch} 要求所有输入同尺寸：{it['name']} 是 "
                          f"{tuple(it['img'].shape[:2])}，首张是 {(h1, w1)}")
-        print(f"[swin_unet] 固定输入尺寸 {arch_img_size[0]}×{arch_img_size[1]}")
+        print(f"[{args.arch}] 固定输入尺寸 {arch_img_size[0]}×{arch_img_size[1]}")
 
     # ---- 模型 ----
     if args.norm == "batch" and args.batch < 2 and not ddp.enabled:
@@ -470,6 +484,20 @@ def main():
         elif not ddp.enabled or ddp.is_main:
             print(f"[SegFormer] variant={args.segformer_variant}，从零训练"
                   f"（--segformer-pretrained 可指定官方权重）")
+    elif args.arch == "transunet":
+        # 延迟导入：TransUNet 依赖 numpy（已装），不需要额外环境
+        from common.transunet import TransUNet2D, load_pretrained_transunet
+        model = TransUNet2D(in_ch=3, out_ch=N_CH, img_size=arch_img_size,
+                            norm=args.norm,
+                            use_checkpoint=not args.transunet_no_checkpoint)
+        if args.transunet_pretrained.lower() != "none":
+            ckpt_path = Path(args.transunet_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            load_pretrained_transunet(
+                model, ckpt_path, verbose=(not ddp.enabled or ddp.is_main))
+        elif not ddp.enabled or ddp.is_main:
+            print("[TransUNet] 已关闭预训练（--transunet-pretrained none），从零训练")
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
