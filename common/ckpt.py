@@ -33,10 +33,14 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
         raise SystemExit(f"[错误] {pth.name} 不是本项目 train.py 保存的权重"
                          f"（缺少 state_dict 字段）")
     sd = ckpt["state_dict"]
-    if "out.weight" not in sd:
-        raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有 out.weight，"
-                         f"无法判断输出通道数")
-    out_ch = int(sd["out.weight"].shape[0])
+    # 输出层的键名随骨架不同：UNet/UNet++/AttentionUNet 是 out.weight；
+    # Swin-Unet 的最终 1x1 conv 在 SwinUNet2D.model.output.weight。
+    out_key = next((k for k in ("out.weight", "output.weight",
+                                "model.output.weight") if k in sd), None)
+    if out_key is None:
+        raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有 out.weight / "
+                         f"model.output.weight，无法判断输出通道数")
+    out_ch = int(sd[out_key].shape[0])
     if require is not None and out_ch != require:
         raise SystemExit(
             f"[错误] 权重 {pth.name} 是 {out_ch} 通道的旧模型，当前流程需要 "
@@ -51,17 +55,27 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
         model = UNetPlusPlus(in_ch=3, out_ch=out_ch, norm=norm)
     elif arch == "attention_unet":
         model = AttentionUNet(in_ch=3, out_ch=out_ch, norm=norm)
+    elif arch == "swin_unet":
+        # 延迟导入：Swin 依赖 timm/einops
+        from common.swin_unet import SwinUNet2D
+        img_size = hp.get("arch_img_size")
+        if not img_size:
+            raise SystemExit(f"[错误] {pth.name} 是 Swin-Unet 权重，但 hparams 里"
+                             f"没有 arch_img_size，无法重建固定尺寸的模型")
+        model = SwinUNet2D(in_ch=3, out_ch=out_ch, img_size=tuple(img_size),
+                           norm=norm)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
-                         f"（只支持 unet / unet++ / attention_unet）")
+                         f"（只支持 unet / unet++ / attention_unet / swin_unet）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {
         "out_ch": out_ch,
         "norm": norm,
         "arch": arch,
+        "arch_img_size": hp.get("arch_img_size"),
         "epoch": ckpt.get("epoch"),
         "val_dice": ckpt.get("val_dice"),
         "class_names": ckpt.get("class_names"),

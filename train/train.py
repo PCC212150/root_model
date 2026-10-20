@@ -233,10 +233,12 @@ def parse_args():
                    help="归一化层：group=GroupNorm（小 batch 稳定）、batch=BatchNorm"
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet",
-                   choices=("unet", "unet++", "attention_unet"),
+                   choices=("unet", "unet++", "attention_unet", "swin_unet"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
-                        "attention_unet=注意力门控跳连（common/attention_unet.py）。"
+                        "attention_unet=注意力门控跳连（common/attention_unet.py）；"
+                        "swin_unet=Swin Transformer U-Net（common/swin_unet.py，"
+                        "固定输入尺寸、不支持 --crop、需要 timm/einops）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
@@ -392,6 +394,25 @@ def main():
         print(f"[来源权重] GT {n_gt} 组 ×1.0 | 其余 {len(src_w_lut) - n_gt} 组 "
               f"×{args.src_weight}")
 
+    # ---- Swin-Unet 的固定输入尺寸 ----
+    # Swin 不是全卷积模型（PatchEmbed 里有 assert），必须按训练时的精确 (H, W)
+    # 实例化；因此不接受 --crop（切片训练/滑窗验证会换尺寸）。
+    arch_img_size = None
+    if args.arch == "swin_unet":
+        if args.crop:
+            sys.exit("[错误] Swin-Unet 是固定尺寸模型，不支持 --crop 切片训练/滑窗验证")
+        h1, w1 = train_ds.items[0]["img"].shape[:2]
+        arch_img_size = (int(h1), int(w1))
+        if h1 % 32 or w1 % 32:
+            sys.exit(f"[错误] Swin-Unet 要求输入 H/W 能被 32 整除"
+                     f"（4 次 patch merging），--size {args.size} 得到 "
+                     f"{h1}×{w1}；请换一个 --size（如 768、1536）")
+        for it in train_ds.items:
+            if it["img"].shape[:2] != (h1, w1):
+                sys.exit(f"[错误] Swin-Unet 要求所有输入同尺寸：{it['name']} 是 "
+                         f"{tuple(it['img'].shape[:2])}，首张是 {(h1, w1)}")
+        print(f"[swin_unet] 固定输入尺寸 {arch_img_size[0]}×{arch_img_size[1]}")
+
     # ---- 模型 ----
     if args.norm == "batch" and args.batch < 2 and not ddp.enabled:
         # DDP 下不适用：下面会把 BatchNorm 换成 SyncBatchNorm，统计量跨卡算
@@ -403,6 +424,11 @@ def main():
         model = UNetPlusPlus(in_ch=3, out_ch=N_CH, norm=args.norm)
     elif args.arch == "attention_unet":
         model = AttentionUNet(in_ch=3, out_ch=N_CH, norm=args.norm)
+    elif args.arch == "swin_unet":
+        # 延迟导入：Swin 依赖 timm/einops，没装的环境仍能跑其它骨架
+        from common.swin_unet import SwinUNet2D
+        model = SwinUNet2D(in_ch=3, out_ch=N_CH, img_size=arch_img_size,
+                           norm=args.norm)
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
@@ -470,7 +496,8 @@ def main():
     log_path = folder / f"{folder.name}_log.txt"
     hparams = {k: (str(v) if isinstance(v, Path) else v)
                for k, v in vars(args).items()}
-    hparams.update({"device": str(device),
+    hparams.update({"arch_img_size": list(arch_img_size) if arch_img_size else None,
+                    "device": str(device),
                     "gpu": torch.cuda.get_device_name(device.index or 0)
                     if device.type == "cuda" else "cpu",
                     "ddp_world_size": ddp.world, "ddp_rank": ddp.rank,
