@@ -157,8 +157,9 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
             if not _warned_mixed_root:
                 _warned_mixed_root = True
                 warns.append(f"root 同时有 {len(root_polys)} 个多边形和 {len(root_lines)} 条折线："
-                             f"**只取多边形**（折线是多边形的中心线，两个都算会重复计根）。"
-                             f"同类文件不再重复提醒")
+                             f"**json 解析只取多边形**（折线是多边形的中心线，两个都算会"
+                             f"重复计根）；训练时若存在 masks/<名>.png，root 通道仍以"
+                             f"像素掩码为准。同类文件不再重复提醒")
         lab.roots = root_polys
         lab.root_polygons = [True] * len(root_polys)
     else:

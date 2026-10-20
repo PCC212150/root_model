@@ -28,7 +28,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import config  # noqa: E402
 from common import device as device_mod, ckpt, image_io, metrics, naming, predict  # noqa: E402
 from common.dataset import (CH_CHECK, CH_ROOT, CH_STEM,  # noqa: E402
-                            build_target_masks, discover_pairs, load_annot)
+                            build_target_masks, discover_pairs, load_annot,
+                            root_mask_path)
 from common.rsml_parse import root_stats  # noqa: E402
 from common.skeleton_stats import (analyze_mask_ex,  # noqa: E402
                                    continuation_flags)
@@ -125,15 +126,19 @@ def main():
                           "ncomp": []} for n in names}
     t_start = time.time()
     n_legacy = 0
-    n_poly = 0
+    n_poly = 0      # root 真值**实际**落在多边形上的图（没有 masks/*.png 时才成立）
+    n_mask = 0      # root 真值来自标注工具像素掩码的图
     for name, img_path, _annot_path in pairs:
         img = image_io.load_rgb(img_path)
         h0, w0 = img.shape[:2]
         annot = load_annot(args.data_dir, name, (w0, h0))
         n_legacy += annot.source == "rsml"
-        # 多边形标注的图（2026-10-06 起支持）：root 通道按**真实轮廓填充**画，
-        # 「GT总长-标注」会变成**轮廓周长**（不是根长）——下面集中告警一次。
-        n_poly += bool(getattr(annot.lab, "root_polygons", None)
+        # GT 的 root 真值默认是 masks/<名>.png（与训练同一口径，use_mask 默认开）。
+        # 只有在**没有掩码**时，才落到多边形填充 —— 那种图才需要下面的周长告警。
+        from_mask = root_mask_path(annot) is not None
+        n_mask += int(from_mask)
+        n_poly += bool(not from_mask
+                       and getattr(annot.lab, "root_polygons", None)
                        and any(annot.lab.root_polygons))
         roots = annot.roots
         gt_count, gt_lens, gt_total_raw = root_stats(roots)
@@ -358,11 +363,15 @@ def main():
         f"# 单位换算：1 px = {mm} mm" if mm else "# 未做 mm 换算",
         f"# 测试总耗时 {el:.1f}s | 单图平均 {el / max(len(pairs), 1):.2f}s",
     ]
+    if n_mask:
+        summary.append(
+            f"# 真值口径：{n_mask}/{len(pairs)} 张的 root 使用 masks/*.png **像素掩码**"
+            f"（与训练同口径；json 多边形不参与像素指标）")
     if n_poly:
         summary.append(
-            f"# ⚠️ 本批 {n_poly}/{len(pairs)} 张是**多边形标注**：root 通道按真实轮廓"
-            f"**填充**画（不是 {mask_width:g}px 中心线）—— ① 像素指标与折线标注的批次"
-            f"**不可比**（前景宽度不同）；② 「GT总长-标注」= 多边形**周长**、不是根长，"
+            f"# ⚠️ 本批 {n_poly}/{len(pairs)} 张**没有像素掩码**、root 真值用多边形"
+            f"**填充**画（不是 {mask_width:g}px 中心线）—— ① 像素指标与折线/掩码口径的"
+            f"批次**不可比**（前景宽度不同）；② 「GT总长-标注」= 多边形**周长**、不是根长，"
             f"该列请忽略，总长以「GT总长-理想」（掩码→骨架口径）为准；③ 根数不受影响")
 
     # create_unique_file 而非 unique_path：两个测试进程同时启动时（一张卡一个），
@@ -398,9 +407,12 @@ def main():
             f"{mae('gt_total_raw', 'pred_total'):.0f} px）")
     print(f"相关性 R（预测 vs 真值）: 长度 {r_len:.3f}（斜率 {k_len:.2f}）| "
           f"面积 {r_ar:.3f}（斜率 {k_ar:.2f}）")
+    if n_mask:
+        print(f"[真值口径] {n_mask}/{len(pairs)} 张的 root 真值使用像素掩码 masks/*.png"
+              f"（与训练同口径）")
     if n_poly:
-        print(f"[注意] 本批 {n_poly}/{len(pairs)} 张是多边形标注：像素指标按"
-              f"填充轮廓算（与折线标注不可比），「GT总长-标注」是周长、不是根长")
+        print(f"[注意] 本批 {n_poly}/{len(pairs)} 张没有像素掩码、root 用多边形填充："
+              f"像素指标与折线/掩码口径不可比，「GT总长-标注」是周长、不是根长")
     print(f"测试总耗时 {el:.1f}s")
     print(f"结果已保存: {csv_path}")
 

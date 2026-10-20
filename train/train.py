@@ -212,8 +212,8 @@ def parse_args():
                    help="非 GT 来源（伪标签，如 scr）的损失权重；GT 恒为 1.0。"
                         "默认 1.0 = 两批数据同等对待；设 0.3 就是给伪标签打折")
     p.add_argument("--no-gt-mask", action="store_true",
-                   help="忽略 GT 的像素级掩码，改用 json 里的多边形 —— 做"
-                        "「掩码 vs 多边形」的 A/B 对照时用")
+                   help="**默认用 GT 的像素级掩码**（masks/<名>.png）作为 root 真值；"
+                        "加这个开关才退回 json 多边形 —— 只用于「掩码 vs 多边形」的 A/B 对照")
     p.add_argument("--epochs", type=int, default=config.EPOCHS)
     p.add_argument("--lr", type=float, default=config.LR)
     p.add_argument("--patience", type=int, default=config.PATIENCE,

@@ -332,6 +332,18 @@ def _warn_empty_root(annot):
           f"那种情况下会把模型教坏。")
 
 
+def root_mask_path(annot):
+    """该样本的像素级 root 掩码路径（`<data_dir>/masks/<名>.png`）；没有返回 None。
+
+    单独拆出来是为了让 **训练日志** 和 `build_target_masks` 用同一套判定：
+    「有没有掩码」决定了 GT 的 root 真值走掩码还是多边形，两边判不一致会误导。
+    """
+    if getattr(annot, "data_dir", None) is None:
+        return None
+    p = Path(annot.data_dir) / MASK_SUBDIR / f"{annot.stem}.png"
+    return p if p.exists() else None
+
+
 def load_root_mask_png(annot, target_size):
     """读标注工具存的**像素级 root 掩码**（`<data_dir>/masks/<名>.png`，黑底白条）。
 
@@ -346,10 +358,8 @@ def load_root_mask_png(annot, target_size):
     —— 5472 缩到 1024 时根只有约 1.9px 宽，最近邻会把细根整段抽没。
     """
     from PIL import Image
-    if getattr(annot, "data_dir", None) is None:
-        return None
-    p = Path(annot.data_dir) / MASK_SUBDIR / f"{annot.stem}.png"
-    if not p.exists():
+    p = root_mask_path(annot)
+    if p is None:
         return None
     with Image.open(p) as im:
         arr = np.asarray(im.convert("L"), dtype=np.uint8)
@@ -511,12 +521,16 @@ class RootDataset(Dataset):
         self.items = []
         n_no_other = 0
         n_legacy = 0
+        n_gt_no_mask = 0
         bytes_full = 0
         for name, img_path, _annot_path in pairs:
             img = image_io.load_rgb(img_path)
             h0, w0 = img.shape[:2]
             annot = load_annot(self.data_dir, name, (w0, h0))
             n_legacy += annot.source == "rsml"
+            # 这条样本的 root 真值会不会被 masks/<名>.png 覆盖。判定与
+            # build_target_masks 用的是同一个 root_mask_path，不会两边说法不一致。
+            root_from_mask = bool(self.use_mask and root_mask_path(annot) is not None)
             if self.crop or self.full:
                 if self.crop and self.crop > min(w0, h0):
                     raise ValueError(f"crop={self.crop} 比 {name} 的短边({min(w0, h0)})还大，"
@@ -526,6 +540,7 @@ class RootDataset(Dataset):
                                                   use_mask=self.use_mask)
                 bytes_full += img.nbytes + masks.nbytes
                 item = {"name": name, "img": img, "masks": masks, "valid": valid,
+                        "root_from_mask": root_from_mask,
                         "fill": _corner_fill(img),
                         "bbox": _annot_bbox(masks) if self.crop else None}
             else:
@@ -536,10 +551,13 @@ class RootDataset(Dataset):
                         "img": image_io.resize_rgb(img, w1, h1),   # (h1,w1,3) uint8
                         "masks": masks,                            # (h1,w1,3) bool
                         "valid": valid,                            # (3,) float32
+                        "root_from_mask": root_from_mask,
                         "fill": _corner_fill(img), "bbox": None}
             if valid[CH_STEM] == 0 or valid[CH_CHECK] == 0:
                 n_no_other += 1
             item["src"] = srcs[len(self.items)]
+            if item["src"] == "GT" and not root_from_mask:
+                n_gt_no_mask += 1
             self.items.append(item)
         if self.crop:
             print(f"[切片训练] 原图不缩放，每轮随机裁 {self.crop}×{self.crop}，"
@@ -558,6 +576,22 @@ class RootDataset(Dataset):
             n_src[it["src"] or "(无来源)"] = n_src.get(it["src"] or "(无来源)", 0) + 1
         if len(n_src) > 1:
             print("[来源] " + " | ".join(f"{k}: {v} 组" for k, v in sorted(n_src.items())))
+        # 真值口径：GT 的 root 默认以标注工具导出的像素掩码为准（不是 json 多边形）。
+        # 这一行必须打在日志里 —— 只看 json 那条告警「只取多边形」会以为训练用的是多边形。
+        if not self.use_mask:
+            print("[真值口径] --no-gt-mask：忽略 masks/*.png，root 走多边形/折线（A/B 对照）")
+        elif any(it["root_from_mask"] for it in self.items):
+            n_mask = {}
+            for it in self.items:
+                k = it["src"] or "(无来源)"
+                n_mask.setdefault(k, [0, 0])
+                n_mask[k][0] += 1
+                n_mask[k][1] += int(it["root_from_mask"])
+            print("[真值口径] root 使用像素掩码 masks/*.png: "
+                  + " | ".join(f"{k}: {u}/{t}" for k, (t, u) in sorted(n_mask.items())))
+        if n_gt_no_mask:
+            print(f"[警告] {n_gt_no_mask} 张 GT 图没有 masks/<名>.png，root 真值退回"
+                  f"多边形/折线 —— GT 默认应当有掩码，请检查装配时是否漏拷 masks/")
         if n_legacy:
             print(f"[警告] {n_legacy} / {len(self.items)} 张图仍用**旧格式**（根系在 .rsml 里）。\n"
                   f"        建议跑一次 tool\\merge_annot 把根系并进 json —— 新旧混用时"
