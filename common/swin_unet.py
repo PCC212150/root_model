@@ -1,13 +1,15 @@
 """Swin-Unet（Cao et al., 2022）的 2D 实现，vendored 自
 `Net/Swin-Unet/networks/swin_transformer_unet_skip_expand_decoder_sys.py`。
 
-原文件是官方 PyTorch 实现（MIT 协议），这里只做了三处改动：
+原文件是官方 PyTorch 实现（MIT 协议），这里只做了四处改动：
 1. 去掉 `__init__` 里的两行 print（每个进程都会打，DDP 下很吵）；
 2. `FinalPatchExpand_X4` 的 `input_resolution` 改用 `self.patches_resolution` ——
    原代码写的是 `img_size // patch_size`，只支持 int（方形）；改成 tuple 后
    支持本项目的非方形输入（如 1536×1024）；
 3. 文件末尾加 `SwinUNet2D` 包装类，接口与本项目其它骨架一致
-   （`in_ch/out_ch/img_size`）。
+   （`in_ch/out_ch/img_size`）；
+4. 文件末尾加 `load_pretrained_encoder()`：加载官方 ImageNet Swin-T 权重
+   （官方 `SwinUnet.load_from` 的等价实现，编码器镜像到解码器）。
 
 **注意**：Swin-Unet 是固定输入尺寸的（PatchEmbed 里有 assert），不支持全卷积
 滑窗推理。因此：
@@ -16,6 +18,7 @@
 - 输入尺寸写进权重的 `arch_img_size`，ckpt 加载时按它重建模型。
 """
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -839,3 +842,105 @@ class SwinUNet2D(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+
+
+def _unwrap_state_dict(ckpt):
+    """取出 checkpoint 里的 state_dict。
+
+    官方 ImageNet 权重存成 {'model': state_dict, 'optimizer': ...}；
+    本项目 train.py 存成 {'state_dict': ...}；也接受裸 state_dict。
+    """
+    if not isinstance(ckpt, dict):
+        raise SystemExit("[错误] Swin 预训练权重不是字典格式，无法识别")
+    for key in ("model", "state_dict"):
+        if isinstance(ckpt.get(key), dict):
+            return ckpt[key]
+    return ckpt
+
+
+def load_pretrained_encoder(model, ckpt_path, verbose: bool = True):
+    """把 ImageNet 预训练的 Swin-T **编码器**灌进 SwinUNet2D，返回统计 dict。
+
+    做法与官方 Swin-Unet 的 `SwinUnet.load_from`（networks/vision_transformer.py）一致：
+
+    1. 丢掉 1000 类分类头 `head.*`；
+    2. 编码器 `layers.i.*` **同时复制**到镜像的解码器 `layers_up.{N-1-i}.*`
+       —— Swin-Unet 的初始化方式，解码器一开始就带有编码器的特征提取能力；
+    3. 形状不一致的键跳过。实际只会跳过 `attn_mask`：它的窗口数由输入分辨率决定
+       （ImageNet ckpt 是 224×224），而本项目是 1024×1536，窗口划分完全不同；
+       `relative_position_bias_table` / `relative_position_index` 与分辨率无关，照常加载。
+
+    **编码器参数必须 100% 命中，否则直接报错**：`strict=False` 本身不会告诉你
+    「以为加载成功了、其实一个都没对上」。用错版本（如 Swin-B）或 timm 的键名会在这里暴露。
+    """
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.is_file():
+        # 延迟导入 config：不把「下载地址」这种展示信息写死在两处
+        import config
+        raise SystemExit(
+            f"[错误] 找不到 Swin 预训练权重: {ckpt_path}\n"
+            f"       下载: curl -L -o \"{ckpt_path}\" {config.SWIN_PRETRAINED_URL}\n"
+            f"       或加 --swin-pretrained none 从零训练")
+    sd = _unwrap_state_dict(
+        torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    # DataParallel 保存的权重带 module. 前缀
+    if sd and all(k.startswith("module.") for k in sd):
+        sd = {k[len("module."):]: v for k, v in sd.items()}
+
+    inner = model.model if isinstance(model, SwinUNet2D) else model
+    n_layers = inner.num_layers
+    model_sd = inner.state_dict()
+
+    # 编码器 -> 编码器 + 镜像解码器
+    full, n_head = {}, 0
+    for k, v in sd.items():
+        if k.startswith("head."):
+            n_head += 1
+            continue
+        full[k] = v
+        if k.startswith("layers."):
+            stage = int(k.split(".")[1])
+            dst = f"layers_up.{n_layers - 1 - stage}" + k[len(f"layers.{stage}"):]
+            full[dst] = v
+
+    to_load, shape_skipped = {}, []
+    for k, v in full.items():
+        if k not in model_sd:
+            continue            # 镜像后落在不存在的解码器节点上（如 layers_up.0 是 PatchExpand）
+        if model_sd[k].shape != v.shape:
+            shape_skipped.append(k)
+            continue
+        to_load[k] = v
+
+    # 编码器参数（attn_mask 这类随分辨率变的 buffer 除外）必须全部对上
+    encoder_keys = [k for k in model_sd
+                    if k.startswith(("patch_embed.", "layers.", "norm."))
+                    and not k.endswith(("attn_mask", "relative_position_index"))]
+    encoder_missing = [k for k in encoder_keys if k not in to_load]
+    if encoder_missing:
+        raise SystemExit(
+            f"[错误] Swin 预训练权重与模型不匹配：{len(encoder_missing)} 个编码器参数"
+            f"没加载上（检查是不是 Swin-T 的 ImageNet 权重）。例如: {encoder_missing[:5]}")
+
+    inner.load_state_dict(to_load, strict=False)
+
+    loaded_params = sum(model_sd[k].numel() for k in to_load)
+    total_params = sum(p.numel() for p in inner.parameters())
+    stats = {
+        "path": str(ckpt_path),
+        "loaded_tensors": len(to_load),
+        "loaded_params": loaded_params,
+        "total_params": total_params,
+        "encoder_tensors": len(encoder_keys),
+        "shape_skipped": shape_skipped,
+        "skipped_head": n_head,
+    }
+    if verbose:
+        enc_loaded = sum(1 for k in encoder_keys if k in to_load)
+        dec_loaded = sum(1 for k in to_load if k.startswith("layers_up."))
+        print(f"[Swin 预训练] {ckpt_path.name}: 编码器 {enc_loaded}/{len(encoder_keys)} 个张量、"
+              f"镜像解码器 {dec_loaded} 个 | 共 {loaded_params / 1e6:.2f}M / "
+              f"{total_params / 1e6:.2f}M 参数")
+        print(f"[Swin 预训练] 跳过分类头 {n_head} 个；形状不符（分辨率相关）"
+              f"{len(shape_skipped)} 个: {sorted(set(k.split('.')[-1] for k in shape_skipped))}")
+    return stats

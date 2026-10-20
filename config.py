@@ -17,6 +17,19 @@ TEST_DATA_DIR = ROOT_DATA_DIR / "test"
 MODEL_DIR = PROJECT_ROOT / "model"        # 模型根目录（内含 model_YYYYMMDDHHMM 子文件夹）
 RESULT_DIR = PROJECT_ROOT / "result"      # 推理结果根目录
 
+# ------------------------- 预训练权重 -------------------------
+# Swin-Unet 编码器（Swin-T）的 ImageNet 预训练权重。*.pth 已被 .gitignore 忽略，
+# **不入库**：服务器上要单独放一份（或 --swin-pretrained 指到别处；none=从零训练）。
+# 官方地址（110MB，2026-10-20 经代理下载校验）：
+#   https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth
+# 注意：官方 Swin 仓库的 22k 版本（..._22k.pth）也能用，但那是先在 ImageNet-22K 上
+# 预训练再微调的，与 1K 版不是同一份，对比实验时要固定用同一份。
+PRETRAINED_DIR = PROJECT_ROOT / "pretrained_ckpt"
+SWIN_PRETRAINED_CKPT = PRETRAINED_DIR / "swin_tiny_patch4_window7_224.pth"
+SWIN_PRETRAINED_URL = ("https://github.com/SwinTransformer/storage/releases/"
+                       "download/v1.0.0/swin_tiny_patch4_window7_224.pth")
+# 本地已校验（2026-10-20）：114342173 字节，md5 34f0d33ced06751da78d8e7149b5f11a
+
 # ========================= 数据集划分记录 =========================
 # **`datasets/` 不入库，所以这份记录是划分的唯一出处。改数据必须回来改这里。**
 #

@@ -238,10 +238,15 @@ def parse_args():
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
                         "swin_unet=Swin Transformer U-Net（common/swin_unet.py，"
-                        "固定输入尺寸、不支持 --crop、需要 timm/einops）。"
+                        "固定输入尺寸、不支持 --crop、需要 timm/einops；默认加载 "
+                        "ImageNet Swin-T 编码器，--swin-pretrained none 关闭）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
+    p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
+                   help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
+                        "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
+                        "只对 --arch swin_unet 生效。相对路径按项目根目录解析")
     p.add_argument("--workers", type=int, default=config.NUM_WORKERS,
                    help="DataLoader 子进程数（0=主进程里同步加载）。服务器上设 4~8 可让"
                         "读图/增强与训练并行，避免 GPU 空等（默认见 config.NUM_WORKERS）")
@@ -426,9 +431,20 @@ def main():
         model = AttentionUNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     elif args.arch == "swin_unet":
         # 延迟导入：Swin 依赖 timm/einops，没装的环境仍能跑其它骨架
-        from common.swin_unet import SwinUNet2D
+        from common.swin_unet import SwinUNet2D, load_pretrained_encoder
         model = SwinUNet2D(in_ch=3, out_ch=N_CH, img_size=arch_img_size,
                            norm=args.norm)
+        # ImageNet 预训练编码器（默认开，--swin-pretrained none 关闭）。
+        # **在包 DDP / 搬上 GPU 之前加载**：各 rank 从同一份 CPU 权重出发，结果一致。
+        if args.swin_pretrained and args.swin_pretrained.lower() != "none":
+            ckpt_path = Path(args.swin_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            # 多卡时只在主进程打日志，避免 3 行一样的输出
+            load_pretrained_encoder(model, ckpt_path,
+                                    verbose=(not ddp.enabled or ddp.is_main))
+        elif not ddp.enabled or ddp.is_main:
+            print("[Swin 预训练] 已关闭（--swin-pretrained none），从零训练")
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
