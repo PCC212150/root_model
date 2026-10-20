@@ -233,16 +233,26 @@ def parse_args():
                    help="归一化层：group=GroupNorm（小 batch 稳定）、batch=BatchNorm"
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet",
-                   choices=("unet", "unet++", "attention_unet", "swin_unet"),
+                   choices=("unet", "unet++", "attention_unet", "swin_unet",
+                            "segformer"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
                         "swin_unet=Swin Transformer U-Net（common/swin_unet.py，"
                         "固定输入尺寸、不支持 --crop、需要 timm/einops；默认加载 "
-                        "ImageNet Swin-T 编码器，--swin-pretrained none 关闭）。"
+                        "ImageNet Swin-T 编码器，--swin-pretrained none 关闭）；"
+                        "segformer=MiT 编码器 + 轻量解码头（common/segformer.py，"
+                        "全卷积、无固定输入尺寸；默认 b2，--segformer-variant 可选 b0~b5）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
+    p.add_argument("--segformer-variant", default="b2",
+                   choices=("b0", "b1", "b2", "b3", "b4", "b5"),
+                   help="SegFormer 变体（默认 b2，约 27M 参数，与 U-Net 31M 最接近）；"
+                        "b0 约 3.7M 适合小数据，b4/b5 显存需求明显更高")
+    p.add_argument("--segformer-pretrained", default="none",
+                   help="SegFormer 官方 mmseg 预训练权重的路径；none=从零训练（默认）。"
+                        "支持 backbone.* / 裸 MiT 键名；只对 --arch segformer 生效")
     p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
                    help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
                         "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
@@ -445,6 +455,21 @@ def main():
                                     verbose=(not ddp.enabled or ddp.is_main))
         elif not ddp.enabled or ddp.is_main:
             print("[Swin 预训练] 已关闭（--swin-pretrained none），从零训练")
+    elif args.arch == "segformer":
+        # 延迟导入：依赖 timm（DropPath 等），没装 timm 的环境仍能跑其它骨架
+        from common.segformer import SegFormer2D, load_pretrained_segformer
+        model = SegFormer2D(in_ch=3, out_ch=N_CH,
+                            variant=args.segformer_variant, norm=args.norm)
+        # 可选预训练：官方 mmseg 权重（默认 none = 从零）
+        if args.segformer_pretrained.lower() != "none":
+            ckpt_path = Path(args.segformer_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            load_pretrained_segformer(model, ckpt_path,
+                                      verbose=(not ddp.enabled or ddp.is_main))
+        elif not ddp.enabled or ddp.is_main:
+            print(f"[SegFormer] variant={args.segformer_variant}，从零训练"
+                  f"（--segformer-pretrained 可指定官方权重）")
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报

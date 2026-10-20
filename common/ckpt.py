@@ -1,4 +1,4 @@
-"""模型权重的统一加载：从 state_dict 识别输出通道数，构造对应的 U-Net。
+"""模型权重的统一加载：从 state_dict 识别输出通道数与骨架，构造对应模型。
 
 原来 inference.py / test.py / tool/tune_stats / experimental_report 各自写了一遍
 `UNet(in_ch=3, out_ch=1)` + `load_state_dict`，改通道数时四处都要动，容易漏。这里统一。
@@ -34,12 +34,15 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
                          f"（缺少 state_dict 字段）")
     sd = ckpt["state_dict"]
     # 输出层的键名随骨架不同：UNet/UNet++/AttentionUNet 是 out.weight；
-    # Swin-Unet 的最终 1x1 conv 在 SwinUNet2D.model.output.weight。
+    # Swin-Unet 是 SwinUNet2D.model.output.weight；
+    # SegFormer 的解码分类头是 decode_head.linear_pred.weight。
     out_key = next((k for k in ("out.weight", "output.weight",
-                                "model.output.weight") if k in sd), None)
+                                "model.output.weight",
+                                "decode_head.linear_pred.weight") if k in sd), None)
     if out_key is None:
-        raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有 out.weight / "
-                         f"model.output.weight，无法判断输出通道数")
+        raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有可识别的输出层"
+                         f"（out.weight / model.output.weight / "
+                         f"decode_head.linear_pred.weight），无法判断输出通道数")
     out_ch = int(sd[out_key].shape[0])
     if require is not None and out_ch != require:
         raise SystemExit(
@@ -64,11 +67,18 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
                              f"没有 arch_img_size，无法重建固定尺寸的模型")
         model = SwinUNet2D(in_ch=3, out_ch=out_ch, img_size=tuple(img_size),
                            norm=norm)
+    elif arch == "segformer":
+        # 延迟导入：依赖 timm（DropPath 等）
+        from common.segformer import SegFormer2D
+        model = SegFormer2D(in_ch=3, out_ch=out_ch,
+                            variant=hp.get("segformer_variant", "b2"),
+                            norm=norm)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
-                         f"（只支持 unet / unet++ / attention_unet / swin_unet）")
+                         f"（只支持 unet / unet++ / attention_unet / swin_unet / "
+                         f"segformer）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {
