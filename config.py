@@ -49,6 +49,13 @@ SAM2_PRETRAINED_CKPT = PRETRAINED_DIR / "sam2.1_hiera_tiny.pt"
 SAM2_PRETRAINED_URL = ("https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
                        "sam2.1_hiera_tiny.pt")
 
+# SAM 3 视觉骨干（ViT-L/14，官方完整 checkpoint 约 3.45GB）。
+# 官方 HF 仓库 facebook/sam3 是 gated（需申请）；国内可用 ModelScope 镜像：
+#   https://modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt
+# 本项目只加载 detector.backbone.vision_backbone.*（trunk + convs）。
+SAM3_PRETRAINED_CKPT = PRETRAINED_DIR / "sam3.pt"
+SAM3_PRETRAINED_URL = "https://modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt"
+
 # ========================= 数据集划分记录 =========================
 # **`datasets/` 不入库，所以这份记录是划分的唯一出处。改数据必须回来改这里。**
 #

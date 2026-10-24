@@ -59,8 +59,8 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/
 
 - U-Net / UNet++ / Attention U-Net：torch 即可。
 - Swin-Unet：`pip install timm einops`；SegFormer：`timm`（装过 Swin 的 einops 就不用了）。
-- TransUNet / SAM / SAM2：**不需要额外装包**——实现已 vendored 到 `common/`。
-  注意 SAM 2 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
+- TransUNet / SAM / SAM2 / SAM3：**不需要额外装包**——实现已 vendored 到 `common/`。
+  注意 SAM 2/3 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
 
 ### 1.6 checkpoint 与测试
 
@@ -205,6 +205,24 @@ torchrun --nproc_per_node=3 train/train.py \
   要同时用 `--sam2-pretrained pretrained_ckpt/sam2.1_hiera_small.pt` 等显式指定。
 - `--sam2-finetune-encoder` 解冻编码器；默认冻结。
 
+### 2.9 `--arch sam3`（SAM 3 ViT-L 视觉骨干 + 监督解码头）
+
+```bash
+torchrun --nproc_per_node=3 train/train.py \
+  --arch sam3 --size 1536 --batch 1 --accum 4 --workers 2 --src-weight 0.3 --epochs 2000
+```
+
+- 同样**不是 promptable 零样本 SAM 3**：只取官方 ViT-L/14 + ViTDet neck 作为骨干，
+  接监督解码头输出三通道 logits。
+- **内部固定缩放到 1008×1008**（SAM3 官方预处理），再归一化到 [-1,1]；输出 logits
+  会双线性上采样回你的 `--size` 实际尺寸，所以外部 `--size` 仍可自由选。
+- 总参数 **455.12M**，默认冻结 ViT-L，可训练只有解码头 **1.08M**。
+- 默认加载 ModelScope 的 `sam3.pt`（3.45GB）；日志应出现
+  `视觉骨干 442 个张量 / 454.04M 参数`。关闭：`--sam3-pretrained none`。
+- 显存（batch1，1024×1536）约 **2.1GB**（冻结编码器）。保存的 checkpoint 约 1.8GB。
+- `--sam3-finetune-encoder` 解冻 ViT-L：默认不推荐（455M 参数、71 张图、显存高）。
+- 官方 HF 仓库是 gated；下载走 ModelScope，见 pretrained_ckpt/README.md。
+
 ---
 
 ## 3. 一页速查
@@ -219,6 +237,7 @@ torchrun --nproc_per_node=3 train/train.py \
 | `transunet` | ✗ | H/W %16 | ✗ | ImageNet-21k R50+ViT | 109.84M / 109.84M | 10.9GB |
 | `sam` | ✓ | 建议 %16 | ✓ | SA-1B ViT-B | 90.24M / **0.57M** | 5.6GB |
 | `sam2` | ✓ | 建议 %16 | ✓ | SAM 2.1 Hiera-T | 28.23M / **1.01M** | 1.4GB |
+| `sam3` | ✓ | 建议 %16 | ✓ | SAM 3 ViT-L | 455.12M / **1.08M** | 2.1GB |
 
 \* 本机 RTX 5060（8GB，batch1，前向+反向）。8GB 卡上的数字超过 8GB 时会发生共享内存
 回退、速度变慢但未必 OOM；3090（24GB）上实际更快、更宽裕。UNet++ 是唯一需要在

@@ -6,6 +6,7 @@
 | TransUNet | `R50+ViT-B_16.npz` | 461217452 B | `--arch transunet` 默认加载（ImageNet-21k R50+ViT-B/16） |
 | SAM | `sam_vit_b_01ec64.pth` | 375042383 B | `--arch sam` 默认加载（SA-1B ViT-B 图像编码器） |
 | SAM 2 | `sam2.1_hiera_tiny.pt` | 156008466 B | `--arch sam2` 默认加载（Hiera-Tiny trunk+neck） |
+| SAM 3 | `sam3.pt` | 3450062241 B | `--arch sam3` 默认加载（ViT-L/14 视觉骨干 + ViTDet neck） |
 
 `*.pth` / `*.npz` 均已被 `.gitignore` 忽略，权重文件不入库；新环境需要单独下载/拷贝。
 
@@ -64,6 +65,22 @@ prompt/mask decoder、memory 全部忽略。`--sam2-variant small|base_plus|larg
 （文件名对应 `sam2.1_hiera_{small,base_plus,large}.pt`，但默认路径仍指向 tiny，
 换变体时用 `--sam2-pretrained` 显式指定）。
 `--sam2-pretrained none` 可关闭预训练。
+
+## SAM 3 ViT-L
+
+`sam3.pt`，3450062241 B（3.45GB），md5 `2615191b18293b447020cf26f4800e51`。
+
+官方 HuggingFace 仓库 `facebook/sam3` 是 **gated（需申请）**；国内直接用 ModelScope 镜像：
+
+```bash
+curl -L -o sam3.pt \
+  https://modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt
+```
+
+只取 `detector.backbone.vision_backbone.trunk.*` 与 `...convs.*`
+（442 个张量 / 454.04M 参数）；文本编码器、detector、tracker 全部忽略。
+`--sam3-pretrained none` 可关闭预训练；`--sam3-finetune-encoder` 可解冻 ViT-L
+（默认冻结；455M 参数，71 张图不建议）。
 
 ## TransUNet R50-ViT-B_16
 

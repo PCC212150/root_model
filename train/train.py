@@ -234,7 +234,7 @@ def parse_args():
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet",
                    choices=("unet", "unet++", "attention_unet", "swin_unet",
-                            "segformer", "transunet", "sam", "sam2"),
+                            "segformer", "transunet", "sam", "sam2", "sam3"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
@@ -250,7 +250,10 @@ def parse_args():
                         "全卷积；默认加载 SA-1B 预训练 ViT-B，--sam-pretrained none 关闭）；"
                         "sam2=SAM 2.1 Hiera 编码器（默认冻结）+ FPN 跳跃解码头"
                         "（common/sam2_seg.py，全卷积；默认加载 Hiera-Tiny，"
-                        "--sam2-pretrained none 关闭）。"
+                        "--sam2-pretrained none 关闭）；"
+                        "sam3=SAM 3 ViT-L/14 视觉骨干（默认冻结）+ ViTDet neck + "
+                        "监督解码头（common/sam3_seg.py，内部缩放到 1008x1008；"
+                        "默认加载 ModelScope 的 sam3.pt，--sam3-pretrained none 关闭）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
@@ -288,6 +291,12 @@ def parse_args():
                         "none=从零训练。只对 --arch sam2 生效；只加载 trunk/neck")
     p.add_argument("--sam2-finetune-encoder", action="store_true",
                    help="解冻 SAM 2 Hiera 编码器一起训练（默认冻结）")
+    p.add_argument("--sam3-pretrained", default=str(config.SAM3_PRETRAINED_CKPT),
+                   help="SAM 3 官方 checkpoint 路径（默认见 config.SAM3_PRETRAINED_CKPT）；"
+                        "none=从零训练。只对 --arch sam3 生效；只加载 ViT+neck")
+    p.add_argument("--sam3-finetune-encoder", action="store_true",
+                   help="解冻 SAM 3 ViT-L 编码器一起训练（默认冻结；455M 参数，"
+                        "解冻后显存会大幅上升，71 张图也不建议）")
     p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
                    help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
                         "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
@@ -552,6 +561,20 @@ def main():
         elif not ddp.enabled or ddp.is_main:
             print(f"[SAM2] {args.sam2_variant} 从零训练"
                   f"（--sam2-pretrained 可指定官方权重）")
+    elif args.arch == "sam3":
+        # 延迟导入；ViT-L + ViTDet neck 已 vendored 在 common/sam3_seg.py
+        from common.sam3_seg import SAM3Seg2D, load_pretrained_sam3
+        model = SAM3Seg2D(in_ch=3, out_ch=N_CH, norm=args.norm,
+                          pretrained=None,
+                          freeze_encoder=not args.sam3_finetune_encoder)
+        if args.sam3_pretrained.lower() != "none":
+            ckpt_path = Path(args.sam3_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            load_pretrained_sam3(model, ckpt_path,
+                                 verbose=(not ddp.enabled or ddp.is_main))
+        elif not ddp.enabled or ddp.is_main:
+            print("[SAM3] 从零训练（--sam3-pretrained 可指定官方权重）")
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
