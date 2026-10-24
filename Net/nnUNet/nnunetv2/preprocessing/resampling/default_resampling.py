@@ -1,0 +1,243 @@
+from collections import OrderedDict
+from copy import deepcopy
+from typing import Union, Tuple, List
+
+import numpy as np
+import torch
+from batchgenerators.augmentations.utils import resize_segmentation, SEG_TIEBREAKS
+from scipy.ndimage import map_coordinates
+from skimage.transform import resize
+from nnunetv2.configuration import ANISO_THRESHOLD
+
+
+def get_do_separate_z(spacing: Union[Tuple[float, ...], List[float], np.ndarray], anisotropy_threshold=ANISO_THRESHOLD):
+    do_separate_z = (np.max(spacing) / np.min(spacing)) > anisotropy_threshold
+    return do_separate_z
+
+
+def get_lowres_axis(new_spacing: Union[Tuple[float, ...], List[float], np.ndarray]):
+    axis = np.where(max(new_spacing) / np.array(new_spacing) == 1)[0]  # find which axis is anisotropic
+    return axis
+
+
+def compute_new_shape(old_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+                      old_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                      new_spacing: Union[Tuple[float, ...], List[float], np.ndarray]) -> np.ndarray:
+    assert len(old_spacing) == len(old_shape)
+    assert len(old_shape) == len(new_spacing)
+    new_shape = np.array([int(round(i / j * k)) for i, j, k in zip(old_spacing, new_spacing, old_shape)])
+    return new_shape
+
+
+def determine_do_sep_z_and_axis(
+        force_separate_z: bool,
+        current_spacing,
+        new_spacing,
+        separate_z_anisotropy_threshold: float = ANISO_THRESHOLD) -> Tuple[bool, Union[int, None]]:
+    if force_separate_z is not None:
+        do_separate_z = force_separate_z
+        if force_separate_z:
+            axis = get_lowres_axis(current_spacing)
+        else:
+            axis = None
+    else:
+        if get_do_separate_z(current_spacing, separate_z_anisotropy_threshold):
+            do_separate_z = True
+            axis = get_lowres_axis(current_spacing)
+        elif get_do_separate_z(new_spacing, separate_z_anisotropy_threshold):
+            do_separate_z = True
+            axis = get_lowres_axis(new_spacing)
+        else:
+            do_separate_z = False
+            axis = None
+
+    if axis is not None:
+        if len(axis) == 3:
+            do_separate_z = False
+            axis = None
+        elif len(axis) == 2:
+            # this happens for spacings like (0.24, 1.25, 1.25) for example. In that case we do not want to resample
+            # separately in the out of plane axis
+            do_separate_z = False
+            axis = None
+        else:
+            axis = axis[0]
+    return do_separate_z, axis
+
+
+def resample_data_or_seg_to_spacing(data: np.ndarray,
+                                    current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                    new_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                    is_seg: bool = False,
+                                    order: int = 3, order_z: int = 0,
+                                    force_separate_z: Union[bool, None] = False,
+                                    separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
+                                    *, seg_tiebreak: str = 'nearest'):
+    do_separate_z, axis = determine_do_sep_z_and_axis(force_separate_z, current_spacing, new_spacing,
+                                                      separate_z_anisotropy_threshold)
+
+    if data is not None:
+        assert data.ndim == 4, "data must be c x y z"
+
+    shape = np.array(data.shape)
+    new_shape = compute_new_shape(shape[1:], current_spacing, new_spacing)
+
+    data_reshaped = resample_data_or_seg(data, new_shape, is_seg, axis, order, do_separate_z, order_z=order_z,
+                                         seg_tiebreak=seg_tiebreak)
+    return data_reshaped
+
+
+def resample_data_or_seg_to_shape(data: Union[torch.Tensor, np.ndarray],
+                                  new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+                                  current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                  new_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                                  is_seg: bool = False,
+                                  order: int = 3, order_z: int = 0,
+                                  force_separate_z: Union[bool, None] = False,
+                                  separate_z_anisotropy_threshold: float = ANISO_THRESHOLD,
+                                  *, seg_tiebreak: str = 'nearest'):
+    """
+    needed for segmentation export. Stupid, I know
+    """
+    if isinstance(data, torch.Tensor):
+        data = data.numpy()
+
+    do_separate_z, axis = determine_do_sep_z_and_axis(force_separate_z, current_spacing, new_spacing,
+                                                      separate_z_anisotropy_threshold)
+
+    if data is not None:
+        assert data.ndim == 4, "data must be c x y z"
+
+    data_reshaped = resample_data_or_seg(data, new_shape, is_seg, axis, order, do_separate_z, order_z=order_z,
+                                         seg_tiebreak=seg_tiebreak)
+    return data_reshaped
+
+
+# Report: /home/isensee/git_repos/random_projects/projects/2026-09_preprocessing_io_speedups/REPORT.md
+# The order_z == 0 gather and the float32 working precision below are bit-identical to the old
+# coordinate-map implementation (nnunetv2/tests/test_resampling.py). The report has the diagnosis of
+# the Dataset003 "hang" they fixed, and the THP/compaction mechanism that was never ruled out.
+def resample_data_or_seg(data: np.ndarray, new_shape: Union[Tuple[float, ...], List[float], np.ndarray],
+                         is_seg: bool = False, axis: Union[None, int] = None, order: int = 3,
+                         do_separate_z: bool = False, order_z: int = 0, dtype_out = None,
+                         *, seg_tiebreak: str = 'nearest'):
+    """
+    separate_z=True will resample with order 0 along z
+    :param data:
+    :param new_shape:
+    :param is_seg:
+    :param axis:
+    :param order:
+    :param do_separate_z:
+    :param order_z: only applies if do_separate_z is True
+    :param seg_tiebreak: only applies if is_seg. How to settle voxels where two labels share the top
+    interpolated indicator, which an even integer resize factor produces at every boundary voxel.
+    'nearest' takes the nearest neighbour label, which is the only choice that is a function of the
+    geometry rather than of the label values; 'lowest' and 'highest' keep the smallest or largest label.
+    See batchgenerators.augmentations.utils.resize_segmentation.
+    :return:
+    """
+    assert data.ndim == 4, "data must be (c, x, y, z)"
+    assert len(new_shape) == data.ndim - 1
+    if is_seg and seg_tiebreak not in SEG_TIEBREAKS:
+        # checked here because resize_segmentation only looks at it where it needs it, which is not at order 0
+        raise ValueError(f'unknown seg_tiebreak: {seg_tiebreak}. Must be one of {SEG_TIEBREAKS}')
+
+    if is_seg:
+        resize_fn = resize_segmentation
+        kwargs = {'seg_tiebreak': seg_tiebreak}
+    else:
+        resize_fn = resize
+        kwargs = {'mode': 'edge', 'anti_aliasing': False}
+    shape = np.array(data[0].shape)
+    new_shape = np.array(new_shape)
+    if dtype_out is None:
+        dtype_out = data.dtype
+    reshaped_final = np.zeros((data.shape[0], *new_shape), dtype=dtype_out)
+    if np.any(shape != new_shape):
+        # float32, not float64. scipy.ndimage accumulates in double internally no matter what dtype the
+        # array has, and for order > 1 it forces a float64 spline prefilter on top of that, so upcasting
+        # the float32 nnU-Net feeds in here buys exactly no accuracy while doubling the memory this
+        # function touches (verified bit-identical, see nnunetv2/tests/test_resampling.py). Anything that
+        # is not already floating point still has to be converted; float64 input is left alone rather
+        # than silently losing precision.
+        if not np.issubdtype(data.dtype, np.floating):
+            data = data.astype(np.float32, copy=False)
+        if do_separate_z:
+            assert axis is not None, 'If do_separate_z, we need to know what axis is anisotropic'
+            if axis == 0:
+                new_shape_2d = new_shape[1:]
+            elif axis == 1:
+                new_shape_2d = new_shape[[0, 2]]
+            else:
+                new_shape_2d = new_shape[:-1]
+
+            for c in range(data.shape[0]):
+                tmp = deepcopy(new_shape)
+                tmp[axis] = shape[axis]
+                reshaped_here = np.zeros(tmp, dtype=data.dtype)
+                for slice_id in range(shape[axis]):
+                    if axis == 0:
+                        reshaped_here[slice_id] = resize_fn(data[c, slice_id], new_shape_2d, order, **kwargs)
+                    elif axis == 1:
+                        reshaped_here[:, slice_id] = resize_fn(data[c, :, slice_id], new_shape_2d, order, **kwargs)
+                    else:
+                        reshaped_here[:, :, slice_id] = resize_fn(data[c, :, :, slice_id], new_shape_2d, order, **kwargs)
+                if shape[axis] != new_shape[axis]:
+                    if order_z == 0:
+                        # Only `axis` still differs in length: the loop above already brought the two
+                        # in-plane axes to their target size. Their coordinate maps in the general
+                        # map_coordinates call below would therefore be exact identities (row_scale and
+                        # col_scale are exactly 1.0), so a 1d nearest neighbor gather along `axis` gives
+                        # bit-identical results. It also avoids materializing three output-sized float64
+                        # coordinate arrays plus the np.array() copy of them, which move roughly 9x the
+                        # output volume through RAM. That block is memory bandwidth bound rather than
+                        # compute bound, so it dominates this function on large volumes and collapses
+                        # throughput once several preprocessing workers run at once.
+                        scale = float(reshaped_here.shape[axis]) / new_shape[axis]
+                        coords = scale * (np.arange(new_shape[axis]) + 0.5) - 0.5
+                        # np.floor(x + 0.5) rather than np.round: this must match how map_coordinates
+                        # rounds at order 0, which is not numpy's round-half-to-even.
+                        indices = np.clip(np.floor(coords + 0.5).astype(np.intp),
+                                          0, reshaped_here.shape[axis] - 1)
+                        reshaped_final[c] = reshaped_here.take(indices, axis=axis)
+                    elif is_seg:
+                        # The in-plane axes are at their target size already, so this resamples `axis`
+                        # alone (the others map onto themselves) - with the same argmax and seg_tiebreak as
+                        # the in-plane pass. The coordinate-map code below used to do segmentations too,
+                        # with a `> 0.5` threshold per label into a zero-initialized array: that left voxels
+                        # unclaimed where three labels meet along `axis`, and gave ties to the last label.
+                        reshaped_final[c] = resize_fn(reshaped_here, new_shape, order_z, **kwargs)
+                    else:
+                        # The following few lines are blatantly copied and modified from sklearn's resize()
+                        rows, cols, dim = new_shape[0], new_shape[1], new_shape[2]
+                        orig_rows, orig_cols, orig_dim = reshaped_here.shape
+
+                        # align_corners=False
+                        row_scale = float(orig_rows) / rows
+                        col_scale = float(orig_cols) / cols
+                        dim_scale = float(orig_dim) / dim
+
+                        map_rows, map_cols, map_dims = np.mgrid[:rows, :cols, :dim]
+                        map_rows = row_scale * (map_rows + 0.5) - 0.5
+                        map_cols = col_scale * (map_cols + 0.5) - 0.5
+                        map_dims = dim_scale * (map_dims + 0.5) - 0.5
+
+                        coord_map = np.array([map_rows, map_cols, map_dims])
+                        reshaped_final[c] = map_coordinates(reshaped_here, coord_map, order=order_z, mode='nearest')[None]
+                else:
+                    reshaped_final[c] = reshaped_here
+        else:
+            for c in range(data.shape[0]):
+                reshaped_final[c] = resize_fn(data[c], new_shape, order, **kwargs)
+        return reshaped_final
+    else:
+        # print("no resampling necessary")
+        return data
+
+
+if __name__ == '__main__':
+    input_array = np.random.random((1, 42, 231, 142))
+    output_shape = (52, 256, 256)
+    out = resample_data_or_seg(input_array, output_shape, is_seg=False, axis=3, order=1, order_z=0, do_separate_z=True)
+    print(out.shape, input_array.shape)

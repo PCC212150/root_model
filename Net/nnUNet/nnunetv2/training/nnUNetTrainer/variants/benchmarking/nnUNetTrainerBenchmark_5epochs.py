@@ -1,0 +1,67 @@
+import subprocess
+
+import torch
+from batchgenerators.utilities.file_and_folder_operations import save_json, join, isfile, load_json
+
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+
+class nnUNetTrainerBenchmark_5epochs(nnUNetTrainer):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        assert self.fold == 0, "It makes absolutely no sense to specify a certain fold. Stick with 0 so that we can parse the results."
+        self.disable_checkpointing = True
+        self.num_epochs = 5
+        assert torch.cuda.is_available(), "This only works on GPU"
+        self.crashed_with_runtime_error = False
+
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        pass
+
+    def save_checkpoint(self, filename: str) -> None:
+        # do not trust people to remember that self.disable_checkpointing must be True for this trainer
+        pass
+
+    def run_training(self):
+        try:
+            super().run_training()
+        except KeyboardInterrupt as ki:
+            raise ki
+        except RuntimeError as e:
+            self.crashed_with_runtime_error = True
+            self.on_train_end()
+            self.print_to_log_file(f"An Exception occurred: {e}")
+
+    def on_train_end(self):
+        super().on_train_end()
+
+        if self.global_rank == 0:
+            torch_version = torch.__version__
+            cudnn_version = torch.backends.cudnn.version()
+            gpu_name = torch.cuda.get_device_name()
+            if self.crashed_with_runtime_error:
+                fastest_epoch = 'Training has ended due to an error. Check your logs for more information.'
+            else:
+                epoch_times = [i - j for i, j in zip(self.logger.get_value('epoch_end_timestamps', step=None),
+                                                     self.logger.get_value('epoch_start_timestamps', step=None))]
+                fastest_epoch = min(epoch_times)
+
+            benchmark_result_file = join(self.output_folder, 'benchmark_result.json')
+            if isfile(benchmark_result_file):
+                old_results = load_json(benchmark_result_file)
+            else:
+                old_results = {}
+            # generate some unique key
+            hostname = subprocess.getoutput('hostname')
+            my_key = f"{hostname}__{cudnn_version}__{torch_version.replace(' ', '')}__{gpu_name.replace(' ', '')}__world_size_{self.world_size}"
+            old_results[my_key] = {
+                'torch_version': torch_version,
+                'cudnn_version': cudnn_version,
+                'gpu_name': gpu_name,
+                'fastest_epoch': fastest_epoch,
+                'world_size': self.world_size,
+                'hostname': hostname
+            }
+            save_json(old_results,
+                      join(self.output_folder, 'benchmark_result.json'))

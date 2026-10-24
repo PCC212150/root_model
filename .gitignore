@@ -35,6 +35,5 @@ venv/
 .DS_Store
 Thumbs.db
 
-# ===== 其他网络 =====
-Net/
+
 
