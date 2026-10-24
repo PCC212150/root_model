@@ -227,6 +227,15 @@ def parse_args():
                    help="逐通道 BCE 正样本权重，逗号分隔、顺序同 CLASS_NAMES"
                         "（如 3,10,1；默认见 config.LOSS_POS_WEIGHT）。"
                         "走命令行是为了做损失实验时不用改 config，实验值也会记进 hparams.json")
+    p.add_argument("--bce-weight", default=None,
+                   help="逐通道 BCE 损失权重，逗号分隔、顺序同 CLASS_NAMES"
+                        "（默认见 config.LOSS_BCE_W）。例如检查 check 通道塌成常数时"
+                        "可调成 1,1,0.3 不变、或单独加 Dice 权重")
+    p.add_argument("--dice-weight", default=None,
+                   help="逐通道 Dice 损失权重，逗号分隔、顺序同 CLASS_NAMES"
+                        "（默认见 config.LOSS_DICE_W，当前 check=0）。"
+                        "check 通道只有 BCE、没有 Dice 时，容易在 60~76% 前景下塌成全 1；"
+                        "做 SAM 系列时可试 1,1,1")
     p.add_argument("--data-dir", type=Path, default=config.TRAIN_DATA_DIR)
     p.add_argument("--out-dir", type=Path, default=config.MODEL_DIR)
     p.add_argument("--norm", default=config.NORM, choices=("group", "batch"),
@@ -366,6 +375,23 @@ def main():
         if len(pos_weight) != N_CH:
             sys.exit(f"[错误] --pos-weight 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
                      f"当前 {len(pos_weight)} 个: {args.pos_weight}")
+
+    def _parse_channel_weights(value, default, name):
+        if value is None:
+            return tuple(default)
+        try:
+            out = tuple(float(v) for v in value.split(","))
+        except ValueError:
+            sys.exit(f"[错误] {name} 解析失败: {value}（应为 1,1,1 这样的形式）")
+        if len(out) != N_CH:
+            sys.exit(f"[错误] {name} 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
+                     f"当前 {len(out)} 个: {value}")
+        return out
+
+    bce_w = _parse_channel_weights(args.bce_weight, config.LOSS_BCE_W,
+                                   "--bce-weight")
+    dice_w = _parse_channel_weights(args.dice_weight, config.LOSS_DICE_W,
+                                    "--dice-weight")
 
     # ---- 多卡（DDP）：torchrun 起才有 LOCAL_RANK，否则就是原来的单卡单进程 ----
     ddp = device_mod.Dist(cpu=args.cpu)
@@ -652,8 +678,8 @@ def main():
                     "val_plants": val_plants, "train_plants": train_plants,
                     "class_names": list(config.CLASS_NAMES), "out_ch": N_CH,
                     "norm": args.norm,
-                    "loss_bce_w": list(config.LOSS_BCE_W),
-                    "loss_dice_w": list(config.LOSS_DICE_W),
+                    "loss_bce_w": list(bce_w),
+                    "loss_dice_w": list(dice_w),
                     "loss_pos_weight": list(pos_weight),
                     "loss_cldice_w": list(config.LOSS_CLDICE_W),
                     "cldice_iters": config.CLDICE_ITERS,
@@ -684,8 +710,8 @@ def main():
         + f" | lr {args.lr} | "
         f"epochs {args.epochs} | 训练 {len(train_names)} 组 | "
         f"验证 {len(val_names)} 组({len(val_plants)} 植株)")
-    log(f"[信息] 通道 {config.CLASS_NAMES} | BCE权重 {config.LOSS_BCE_W} | "
-        f"Dice权重 {config.LOSS_DICE_W} | 正样本权重 {pos_weight}")
+    log(f"[信息] 通道 {config.CLASS_NAMES} | BCE权重 {bce_w} | "
+        f"Dice权重 {dice_w} | 正样本权重 {pos_weight}")
     log(f"[信息] 学习率 {args.lr} | 平台期 {args.lr_patience} 轮不减半就 ×{config.LR_FACTOR}"
         f"（下限 {config.MIN_LR}）| 早停 {args.patience} 轮")
     log(f"[信息] clDice 拓扑损失: "
@@ -730,11 +756,11 @@ def main():
                     bce = F.binary_cross_entropy_with_logits(
                         out.float(), y, pos_weight=pos_w,
                         reduction="none").mean(dim=(2, 3))
-                    wb = channel_weights(config.LOSS_BCE_W, valid)
+                    wb = channel_weights(bce_w, valid)
                     if sw is not None:
                         wb = wb * sw              # (B,C) × (B,1)，逐样本加权
                     loss_bce = (bce * wb).sum() / wb.sum().clamp(min=1e-6)
-                    wd = channel_weights(config.LOSS_DICE_W, valid)
+                    wd = channel_weights(dice_w, valid)
                     if sw is not None:
                         wd = wd * sw
                     loss_dice = ((dice_loss(prob.float(), y) * wd).sum()

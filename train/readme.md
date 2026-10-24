@@ -39,6 +39,14 @@
   SyncBatchNorm，因此每卡 batch=1 也可用（全局统计量跨卡同步）。
 - `--norm group` 不依赖 batch 统计量，但显存比 BatchNorm 高约一倍。
 - 显存不够时优先降 `--size`，其次用 `--accum` 换等效 batch（不能救 BatchNorm 的 batch=1）。
+- ⚠️ **冻结骨干的模型（sam / sam2 / sam3）建议用 `--norm group`**：解码头只有
+  BatchNorm 时，训练用 batch 统计量、验证/测试用滑动平均，batch=1（含 DDP 每卡 1 张）
+  下两者差异很大，实测 SAM2 的 check 通道在 eval 模式直接塌成全 1
+  （val check Dice 恒定 0.7847）。GroupNorm 训练/推理行为一致。
+- check 通道默认**没有 Dice 项**（`LOSS_DICE_W=(1,1,0)`），前景占 60~76% 时
+  BCE 的天然最优就是全 1。U-Net 靠高分辨率跳跃能学出矩形；冻结骨干的小解码器
+  容易直接塌成常数。需要 check 通道可用 `--dice-weight 1,1,1`（这是协议变更，
+  对比实验要么所有模型都加、要么单独标注）。
 
 ### 1.4 三卡训练模板
 
@@ -185,16 +193,24 @@ torchrun --nproc_per_node=3 train/train.py \
 - `--sam-finetune-encoder` 解冻编码器一起训练：默认不推荐（71 张图容易过拟合，显存也高）。
 - ⚠️ **SAM1 编码器只输出 1/16 特征图，解码器没有高分辨率跳跃**；1024×1536 下根宽
   只有约 2px，到 1/16 特征图上不足 1px。实测它在细根任务上明显弱于 U-Net，
-  且 check 通道容易塌成常数（check 的 Dice 权重为 0，BCE 只占 0.3）。要试 SAM 系列，
-  优先用 `--arch sam2`（Hiera 的 FPN 提供 1/4、1/8、1/16 三级特征）。
+  且 check 通道容易塌成常数（check 的 Dice 权重为 0，BCE 只占 0.3）。
+  要试 SAM 系列，优先用 `--arch sam2`（Hiera 的 FPN 提供 1/4、1/8、1/16 三级特征）。
+- 跑 SAM1 时同样建议 `--norm group --dice-weight 1,1,1`（理由见 1.3 与 SAM2 一节）。
 
 ### 2.8 `--arch sam2`（SAM 2.1 Hiera + FPN 跳跃解码头）
 
 ```bash
 torchrun --nproc_per_node=3 train/train.py \
-  --arch sam2 --size 1536 --batch 1 --accum 4 --workers 2 --src-weight 0.3 --epochs 2000
+  --arch sam2 --size 1536 --batch 1 --accum 4 --workers 2 --src-weight 0.3 --epochs 2000 \
+  --norm group --dice-weight 1,1,1
 ```
 
+- **必须加 `--norm group`**：解码头用 BatchNorm 时，batch=1（DDP 每卡 1 张）下
+  eval 的滑动平均与训练 batch 统计差很多，实测 check 通道在 eval 直接全 1；
+  GroupNorm 没有这个问题。
+- **`--dice-weight 1,1,1` 是按需的协议变更**：不加时 check 仍会塌成全 1
+  （BCE 在 60~76% 前景下的最优解）；加上后约 6 轮 check Dice 从 0.79 升到 0.9+。
+  如果整张对比表要保持同一损失，要么所有模型都加这一项、要么都不加。
 - 同样**不是 promptable 零样本 SAM 2**，定位与 `--arch sam` 一致：Hiera 图像编码器 +
   监督解码头；区别是 SAM 2 的 FPN 提供 1/4、1/8、1/16 三级跳跃特征。
 - 全卷积，支持 `--crop`；总参数 **28.23M**，默认冻结编码器，可训练 **1.01M**。
@@ -221,6 +237,8 @@ torchrun --nproc_per_node=3 train/train.py \
   `视觉骨干 442 个张量 / 454.04M 参数`。关闭：`--sam3-pretrained none`。
 - 显存（batch1，1024×1536）约 **2.1GB**（冻结编码器）。保存的 checkpoint 约 1.8GB。
 - `--sam3-finetune-encoder` 解冻 ViT-L：默认不推荐（455M 参数、71 张图、显存高）。
+- 同样建议 `--norm group --dice-weight 1,1,1`（BatchNorm batch=1 的 eval 塌陷 +
+  check 通道 BCE-only 塌成全 1，原因见 1.3 与 SAM2 一节）。
 - 官方 HF 仓库是 gated；下载走 ModelScope，见 pretrained_ckpt/README.md。
 
 ---
@@ -251,6 +269,8 @@ torchrun --nproc_per_node=3 train/train.py \
 | `--norm group` | GroupNorm；单卡 batch=1 时用，显存比 BatchNorm 高约一倍 |
 | `--no-amp` | 关闭混合精度（调试数值问题用） |
 | `--pos-weight 1,10,1` | 覆盖逐通道 BCE 正样本权重（默认见 config） |
+| `--bce-weight 1,1,0.3` | 覆盖逐通道 BCE 权重（默认见 config，格式同上） |
+| `--dice-weight 1,1,1` | 覆盖逐通道 Dice 权重；check 默认 0，冻结骨干模型可加 1 防止塌成全 1 |
 | `--no-gt-mask` | 忽略 GT 像素掩码、改用 json 多边形；**只用于 A/B 对照** |
 | `--val-size N` | 验证集植株数（默认 config.VAL_SIZE；当前由 VAL_PLANTS 钉死） |
 | `--patience` / `--lr-patience` | 早停 / 降 LR 的耐心轮数 |
