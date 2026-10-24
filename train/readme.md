@@ -99,8 +99,16 @@ python train/train.py --arch unet --task check_background ...
   ```
 - `--task all` 保留原来的**三通道联合模型**（输出 3 通道，旧行为）。要复现
   2026-10-25 之前的实验，命令里必须显式加 `--task all`。
-- 单通道模型目前**没有**接入 `inference.py`（它依赖三通道的检查范围/根统计）；
-  部署时 root/stem 的 ROI 需要单独跑 check_background 模型，工具待接入。
+- 单通道推理用 [inference_task.py](../inference_task.py)：
+  ```bash
+  # check 单独跑
+  python inference_task.py --model model_2026xxxxxxxx-check_background --dir <图片文件夹>
+
+  # root / stem：用 check 模型提供 ROI
+  python inference_task.py --model model_2026xxxxxxxx \
+      --check-model model_2026xxxxxxxx-check_background --dir <图片文件夹>
+  ```
+  `inference.py` 仍是三通道联合模型专用。
 
 ### 1.7 checkpoint 与测试
 
