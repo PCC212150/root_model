@@ -291,6 +291,20 @@ def predict(model, img: np.ndarray, max_side: int, stride: int = 16,
                     prob_root_t, w0, h0, threshold=0.5, channel=0)
                 mask_counted &= exact
                 root_ok = False
+    elif low_thresh and low_thresh > 0:
+        # **检查范围不可用时没有 ROI 约束**：滞回低阈值同样可能把整图判成根。
+        # 2026-10-24 实测：某 SAM 模型的 check 通道塌成全 1 → ROI 被判定异常
+        # （CHECK_MAX_RATIO）→ 不走上面的兜底 → 低阈值 0.10 把整张图判成根，
+        # 「预测根系面积」恰好等于原图面积（19.96M px²），根数/总长全部爆掉。
+        # 这里用整图覆盖率补同一道兜底：超过 PRED_MAX_ROOT_RATIO 就退回高阈值 0.5。
+        cov = float(mask_counted.mean())
+        if cov > config.PRED_MAX_ROOT_RATIO:
+            print(f"[警告] 检查范围不可用，且滞回低阈值({low_thresh})把整图淹没了："
+                  f"根占图面 {cov:.1%}（上限 {config.PRED_MAX_ROOT_RATIO:.0%}），"
+                  f"退回只用高阈值 0.5 重算。通常是模型的背景概率有底噪。")
+            mask_counted = image_io.prob_to_orig_mask(
+                prob_root_t, w0, h0, threshold=0.5, channel=0)
+            root_ok = False
 
     # ---- 其余通道：普通 0.5 阈值（茎/检查范围是块状目标，不需要滞回） ----
     # 只算**真的有人用**的通道：全分辨率二值化一张要 ~100ms。逐处查过调用方 ——

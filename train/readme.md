@@ -183,6 +183,10 @@ torchrun --nproc_per_node=3 train/train.py \
 - 显存（batch1，1024×1536）：约 **5.6GB**。
 - `--sam-variant vit_b|vit_l|vit_h`（默认 vit_b；vit_h 636M，24GB 上很可能 OOM）。
 - `--sam-finetune-encoder` 解冻编码器一起训练：默认不推荐（71 张图容易过拟合，显存也高）。
+- ⚠️ **SAM1 编码器只输出 1/16 特征图，解码器没有高分辨率跳跃**；1024×1536 下根宽
+  只有约 2px，到 1/16 特征图上不足 1px。实测它在细根任务上明显弱于 U-Net，
+  且 check 通道容易塌成常数（check 的 Dice 权重为 0，BCE 只占 0.3）。要试 SAM 系列，
+  优先用 `--arch sam2`（Hiera 的 FPN 提供 1/4、1/8、1/16 三级特征）。
 
 ### 2.8 `--arch sam2`（SAM 2.1 Hiera + FPN 跳跃解码头）
 
