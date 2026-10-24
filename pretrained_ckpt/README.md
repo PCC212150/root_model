@@ -4,6 +4,7 @@
 | --- | --- | --- | --- |
 | Swin-Unet | `swin_tiny_patch4_window7_224.pth` | 114342173 B | `--arch swin_unet` 默认加载（ImageNet-1K Swin-T） |
 | TransUNet | `R50+ViT-B_16.npz` | 461217452 B | `--arch transunet` 默认加载（ImageNet-21k R50+ViT-B/16） |
+| SAM | `sam_vit_b_01ec64.pth` | 375042383 B | `--arch sam` 默认加载（SA-1B ViT-B 图像编码器） |
 
 `*.pth` / `*.npz` 均已被 `.gitignore` 忽略，权重文件不入库；新环境需要单独下载/拷贝。
 
@@ -33,6 +34,20 @@ GitHub 不通时走已有的代理，或在能上网的机器下好后拷到服�
 - 编码器参数没有 100% 命中会直接报错，不会静默地从零训练。
 
 `*.pth` 已被 `.gitignore` 忽略，权重文件不入库；新环境需要单独下载/拷贝。
+
+## SAM ViT-B
+
+`sam_vit_b_01ec64.pth`，375042383 B，md5 `01ec64d29a2fca3f0661936605ae66f8`。
+
+```bash
+curl -L -o sam_vit_b_01ec64.pth \
+  https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+```
+
+只取其中的**图像编码器**（`image_encoder.*`，177 个张量 / 89.67M 参数）；
+prompt encoder 与 mask decoder 在本项目中不使用（我们是三通道监督分割，
+没有点/框提示来源，见 `common/sam_seg.py` 的说明）。
+`--sam-pretrained none` 可关闭预训练；`--sam-variant vit_l/vit_h` 可选更大编码器。
 
 ## TransUNet R50-ViT-B_16
 

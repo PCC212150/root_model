@@ -234,7 +234,7 @@ def parse_args():
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet",
                    choices=("unet", "unet++", "attention_unet", "swin_unet",
-                            "segformer", "transunet"),
+                            "segformer", "transunet", "sam"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
@@ -245,7 +245,9 @@ def parse_args():
                         "全卷积、无固定输入尺寸；默认 b2，--segformer-variant 可选 b0~b5）；"
                         "transunet=R50-ViT-B_16 + DecoderCup（common/transunet.py，"
                         "固定输入尺寸、不支持 --crop、默认开梯度检查点；"
-                        "默认加载 ImageNet-21k 预训练，--transunet-pretrained none 关闭）。"
+                        "默认加载 ImageNet-21k 预训练，--transunet-pretrained none 关闭）；"
+                        "sam=SAM 图像编码器（默认冻结）+ 监督解码头（common/sam_seg.py，"
+                        "全卷积；默认加载 SA-1B 预训练 ViT-B，--sam-pretrained none 关闭）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
@@ -264,6 +266,16 @@ def parse_args():
     p.add_argument("--transunet-no-checkpoint", action="store_true",
                    help="关闭 TransUNet ViT 的梯度检查点：更快，但 1024x1536 下"
                         "12 层、6144 token 的注意力激活很可能在 24GB 上 OOM")
+    p.add_argument("--sam-variant", default="vit_b",
+                   choices=("vit_b", "vit_l", "vit_h"),
+                   help="SAM 图像编码器规模（默认 vit_b，约 90M；vit_h 约 636M，"
+                        "24GB 上 1024x1536 很可能 OOM）")
+    p.add_argument("--sam-pretrained", default=str(config.SAM_PRETRAINED_CKPT),
+                   help="SAM 官方检查点路径（默认见 config.SAM_PRETRAINED_CKPT）；"
+                        "none=从零训练。只对 --arch sam 生效；只加载图像编码器")
+    p.add_argument("--sam-finetune-encoder", action="store_true",
+                   help="解冻 SAM 图像编码器一起训练（默认冻结：71 张图从零微调 90M "
+                        "编码器容易过拟合，显存也高得多）")
     p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
                    help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
                         "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
@@ -498,6 +510,21 @@ def main():
                 model, ckpt_path, verbose=(not ddp.enabled or ddp.is_main))
         elif not ddp.enabled or ddp.is_main:
             print("[TransUNet] 已关闭预训练（--transunet-pretrained none），从零训练")
+    elif args.arch == "sam":
+        # 延迟导入；SAM 编码器 vendored 在 common/sam_seg.py，不依赖 segment_anything 包
+        from common.sam_seg import SAMSeg2D, load_pretrained_sam
+        model = SAMSeg2D(in_ch=3, out_ch=N_CH, variant=args.sam_variant,
+                         norm=args.norm, pretrained=None,
+                         freeze_encoder=not args.sam_finetune_encoder)
+        if args.sam_pretrained.lower() != "none":
+            ckpt_path = Path(args.sam_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            load_pretrained_sam(model, ckpt_path,
+                                verbose=(not ddp.enabled or ddp.is_main))
+        elif not ddp.enabled or ddp.is_main:
+            print(f"[SAM] {args.sam_variant} 从零训练"
+                  f"（--sam-pretrained 可指定官方权重）")
     else:
         model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报

@@ -39,13 +39,15 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
     out_key = next((k for k in ("out.weight", "output.weight",
                                 "model.output.weight",
                                 "decode_head.linear_pred.weight",
-                                "model.segmentation_head.0.weight")
+                                "model.segmentation_head.0.weight",
+                                "decoder.out.weight")
                     if k in sd), None)
     if out_key is None:
         raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有可识别的输出层"
                          f"（out.weight / model.output.weight / "
                          f"decode_head.linear_pred.weight / "
-                         f"model.segmentation_head.0.weight），无法判断输出通道数")
+                         f"model.segmentation_head.0.weight / decoder.out.weight），"
+                         f"无法判断输出通道数")
     out_ch = int(sd[out_key].shape[0])
     if require is not None and out_ch != require:
         raise SystemExit(
@@ -85,12 +87,18 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
                              f"没有 arch_img_size，无法重建固定尺寸的模型")
         model = TransUNet2D(in_ch=3, out_ch=out_ch, img_size=tuple(img_size),
                             norm=norm)
+    elif arch == "sam":
+        # 延迟导入；全卷积，不需要 arch_img_size
+        from common.sam_seg import SAMSeg2D
+        model = SAMSeg2D(in_ch=3, out_ch=out_ch,
+                         variant=hp.get("sam_variant", "vit_b"),
+                         norm=norm, pretrained=None)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
                          f"（只支持 unet / unet++ / attention_unet / swin_unet / "
-                         f"segformer / transunet）")
+                         f"segformer / transunet / sam）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {

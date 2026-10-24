@@ -37,6 +37,12 @@ TRANSUNET_PRETRAINED_CKPT = PRETRAINED_DIR / "R50+ViT-B_16.npz"
 TRANSUNET_PRETRAINED_URL = ("https://storage.googleapis.com/vit_models/"
                             "imagenet21k/R50+ViT-B_16.npz")
 
+# SAM 图像编码器（ViT-B，375MB，SA-1B 预训练）。本项目用「冻结编码器 + 监督解码头」，
+# 不是 promptable 的零样本 SAM（原因见 common/sam_seg.py 的模块说明）。
+SAM_PRETRAINED_CKPT = PRETRAINED_DIR / "sam_vit_b_01ec64.pth"
+SAM_PRETRAINED_URL = ("https://dl.fbaipublicfiles.com/segment_anything/"
+                      "sam_vit_b_01ec64.pth")
+
 # ========================= 数据集划分记录 =========================
 # **`datasets/` 不入库，所以这份记录是划分的唯一出处。改数据必须回来改这里。**
 #
@@ -471,7 +477,7 @@ SELECT_SMOOTH = 1         # 选模型判据的**滑动平均窗口**（轮）。
                           # 教训见 README「这个数据规模测不出小差异」一节。
 VAL_SIZE = 4              # 验证集**植株数**：同一植株的所有时点整组进同一侧，避免同株泄漏
                           # 只在 VAL_PLANTS 为空时生效（现在非空，所以它其实是回退值）
-VAL_PLANTS = ("S062-4", "S068-3", "S127-2", "S221-3")
+VAL_PLANTS = ("S062-4", "S068-3", "S062-1", "S068-1")
                           # 2026-09-29 起**钉死**这 4 株（6 组）当验证集。
                           # 为什么钉死而不是随机：train 现在是 26 株、其中 4 株是 CK/PEG
                           # （每株 5~8 组），`split_by_plant` 按 SEED 随机抽的话**有可能抽到
