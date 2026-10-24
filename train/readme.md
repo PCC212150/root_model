@@ -241,6 +241,17 @@ torchrun --nproc_per_node=3 train/train.py \
   check 通道 BCE-only 塌成全 1，原因见 1.3 与 SAM2 一节）。
 - 官方 HF 仓库是 gated；下载走 ModelScope，见 pretrained_ckpt/README.md。
 
+### 2.10 nnU-Net（外部框架，不是 `--arch`）
+
+nnU-Net 是完整框架（自己的 dataset 格式、plan/preprocess、5 折训练、预测），
+不能塞进 `--arch`。按 [tool/nnunet/README.md](../tool/nnunet/README.md) 走：
+
+```bash
+python tool/nnunet/export_dataset.py --out nnUNet_raw   # root/stem/check 三个二分类数据集
+# 然后在新 Python 3.11 环境里用 nnUNetv2_plan_and_preprocess / nnUNetv2_train / nnUNetv2_predict
+python tool/nnunet/eval_predictions.py ...              # 用项目自己的指标评测
+```
+
 ---
 
 ## 3. 一页速查
