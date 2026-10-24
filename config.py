@@ -43,6 +43,12 @@ SAM_PRETRAINED_CKPT = PRETRAINED_DIR / "sam_vit_b_01ec64.pth"
 SAM_PRETRAINED_URL = ("https://dl.fbaipublicfiles.com/segment_anything/"
                       "sam_vit_b_01ec64.pth")
 
+# SAM 2.1 Hiera 图像编码器（tiny 约 149MB）。与 SAM1 一样只用编码器 + 监督解码头。
+# 其它变体的下载地址把文件名换成 sam2.1_hiera_{small,base_plus,large}.pt 即可。
+SAM2_PRETRAINED_CKPT = PRETRAINED_DIR / "sam2.1_hiera_tiny.pt"
+SAM2_PRETRAINED_URL = ("https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
+                       "sam2.1_hiera_tiny.pt")
+
 # ========================= 数据集划分记录 =========================
 # **`datasets/` 不入库，所以这份记录是划分的唯一出处。改数据必须回来改这里。**
 #

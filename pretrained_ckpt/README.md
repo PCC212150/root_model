@@ -5,6 +5,7 @@
 | Swin-Unet | `swin_tiny_patch4_window7_224.pth` | 114342173 B | `--arch swin_unet` 默认加载（ImageNet-1K Swin-T） |
 | TransUNet | `R50+ViT-B_16.npz` | 461217452 B | `--arch transunet` 默认加载（ImageNet-21k R50+ViT-B/16） |
 | SAM | `sam_vit_b_01ec64.pth` | 375042383 B | `--arch sam` 默认加载（SA-1B ViT-B 图像编码器） |
+| SAM 2 | `sam2.1_hiera_tiny.pt` | 156008466 B | `--arch sam2` 默认加载（Hiera-Tiny trunk+neck） |
 
 `*.pth` / `*.npz` 均已被 `.gitignore` 忽略，权重文件不入库；新环境需要单独下载/拷贝。
 
@@ -48,6 +49,21 @@ curl -L -o sam_vit_b_01ec64.pth \
 prompt encoder 与 mask decoder 在本项目中不使用（我们是三通道监督分割，
 没有点/框提示来源，见 `common/sam_seg.py` 的说明）。
 `--sam-pretrained none` 可关闭预训练；`--sam-variant vit_l/vit_h` 可选更大编码器。
+
+## SAM 2.1 Hiera-Tiny
+
+`sam2.1_hiera_tiny.pt`，156008466 B，md5 `6aa6761c9da74fbaa74b4c790a0a2007`。
+
+```bash
+curl -L -o sam2.1_hiera_tiny.pt \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
+```
+
+只取 `image_encoder.trunk.*` 与 `image_encoder.neck.*`（162 个张量 / 27.22M 参数）；
+prompt/mask decoder、memory 全部忽略。`--sam2-variant small|base_plus|large` 可换更大编码器
+（文件名对应 `sam2.1_hiera_{small,base_plus,large}.pt`，但默认路径仍指向 tiny，
+换变体时用 `--sam2-pretrained` 显式指定）。
+`--sam2-pretrained none` 可关闭预训练。
 
 ## TransUNet R50-ViT-B_16
 
