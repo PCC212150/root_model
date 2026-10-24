@@ -87,8 +87,9 @@ nnU-Net 会自动选 2D 配置；可以打开 plans 看一眼 patch size / batch
 cd ~/project-PCC/Deep_learning_model_for_sugarcane/root_model
 source ~/anaconda3/etc/profile.d/conda.sh && conda activate nnunet
 
+# 先 nvidia-smi 看哪张卡空；下面按 2 号卡举例
 for d in 501 502 503; do
-  CUDA_VISIBLE_DEVICES=0 nnUNetv2_train $d 2d 0 --npz
+  CUDA_VISIBLE_DEVICES=2 nnUNetv2_train $d 2d 0 --npz
 done
 ```
 
@@ -97,7 +98,7 @@ done
 ```bash
 for d in 501 502 503; do
   for f in 1 2 3 4; do
-    CUDA_VISIBLE_DEVICES=0 nnUNetv2_train $d 2d $f --npz
+    CUDA_VISIBLE_DEVICES=2 nnUNetv2_train $d 2d $f --npz
   done
 done
 ```
@@ -113,7 +114,7 @@ done
 
 ```bash
 for d in 501 502 503; do
-  nnUNetv2_predict -d $d \
+  nnUNetv2_predict -d $d -c 2d \
     -i nnUNet_raw/Dataset${d}_*/imagesTs \
     -o nnUNet_results/preds_$d \
     -f 0 1 2 3 4 -chk checkpoint_best.pth
