@@ -50,7 +50,8 @@ from common.attention_unet import AttentionUNet  # noqa: E402
 from common.unet import UNet  # noqa: E402
 from common.unet_plusplus import UNetPlusPlus  # noqa: E402
 
-N_CH = len(config.CLASS_NAMES)
+N_CH = len(config.CLASS_NAMES)          # 数据里的三通道
+TASK_TO_CH = {"root": 0, "stem": 1, "check_background": 2}
 
 
 def dice_loss(prob, target):
@@ -141,7 +142,7 @@ def _accumulate(pb, gt, vd, d_all, i_all):
     pb / gt 是 (C, h, w) 的 bool，vd 是 (C,)。在**原图分辨率**上算。
     """
     ds, is_ = [], []
-    for c in range(N_CH):
+    for c in range(len(vd)):
         if vd[c] < 0.5:
             ds.append(np.nan)
             is_.append(np.nan)
@@ -237,7 +238,16 @@ def parse_args():
                         "check 通道只有 BCE、没有 Dice 时，容易在 60~76% 前景下塌成全 1；"
                         "做 SAM 系列时可试 1,1,1")
     p.add_argument("--data-dir", type=Path, default=config.TRAIN_DATA_DIR)
-    p.add_argument("--out-dir", type=Path, default=config.MODEL_DIR)
+    p.add_argument("--task", default="root",
+                   choices=("root", "stem", "check_background", "all"),
+                   help="单独训练的通道（默认 root）。root/stem/check_background 训练"
+                        "**单通道模型**（输出 1 通道）；文件夹名分别加后缀 "
+                        "''、-stem、-check_background；"
+                        "all=旧的三通道联合模型（输出 3 通道），用于兼容历史实验")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="模型输出根目录（默认 config.MODEL_DIR）。单通道任务的文件夹名"
+                        "会加后缀：root 不加，stem 加 -stem，check_background 加 "
+                        "-check_background")
     p.add_argument("--norm", default=config.NORM, choices=("group", "batch"),
                    help="归一化层：group=GroupNorm（小 batch 稳定）、batch=BatchNorm"
                         "（需 batch≥2，默认见 config.NORM）")
@@ -364,34 +374,55 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # 逐通道正样本权重：命令行优先，否则用 config。长度必须与 CLASS_NAMES 对齐，
-    # 否则 pos_weight 会广播到错误的通道上（错得不明显，只是学得不对）。
-    pos_weight = config.LOSS_POS_WEIGHT
-    if args.pos_weight:
-        try:
-            pos_weight = tuple(float(v) for v in args.pos_weight.split(","))
-        except ValueError:
-            sys.exit(f"[错误] --pos-weight 解析失败: {args.pos_weight}（应为 3,10,1 这样的形式）")
-        if len(pos_weight) != N_CH:
-            sys.exit(f"[错误] --pos-weight 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
-                     f"当前 {len(pos_weight)} 个: {args.pos_weight}")
+    # ---- 单通道 / 三通道任务 ----
+    task = args.task
+    task_ch = None if task == "all" else TASK_TO_CH[task]
+    task_name = task
+    model_out_ch = N_CH if task_ch is None else 1
+    out_dir = config.MODEL_DIR if args.out_dir is None else args.out_dir
+    # 单通道任务的模型文件夹加后缀；root / all 不加
+    folder_suffix = "" if task in ("root", "all") else f"-{task}"
+    if task_ch is None:
+        print("[任务] all：三通道联合模型（旧行为）")
+    else:
+        print(f"[任务] {task_name}：单通道模型（输出 1 通道），"
+              f"模型文件夹后缀 '{folder_suffix}'")
 
+    # 逐通道权重：命令行可给 1 个数（只作用于当前单通道任务）或 3 个数
+    # （顺序同 CLASS_NAMES）。长度不对会静默广播错，所以这里严格校验。
     def _parse_channel_weights(value, default, name):
         if value is None:
-            return tuple(default)
-        try:
-            out = tuple(float(v) for v in value.split(","))
-        except ValueError:
-            sys.exit(f"[错误] {name} 解析失败: {value}（应为 1,1,1 这样的形式）")
-        if len(out) != N_CH:
-            sys.exit(f"[错误] {name} 需要 {N_CH} 个数（顺序 {config.CLASS_NAMES}），"
-                     f"当前 {len(out)} 个: {value}")
-        return out
+            out = tuple(default)
+        else:
+            try:
+                out = tuple(float(v) for v in value.split(","))
+            except ValueError:
+                sys.exit(f"[错误] {name} 解析失败: {value}（应为 1,1,1 或单个数）")
+        if len(out) == N_CH:
+            return out
+        if len(out) == 1 and task_ch is not None:
+            return tuple(out[0] if i == task_ch else default[i]
+                         for i in range(N_CH))
+        sys.exit(f"[错误] {name} 需要 1 个数（单通道任务）或 {N_CH} 个数"
+                 f"（顺序 {config.CLASS_NAMES}），当前 {len(out)} 个: {value}")
 
+    pos_weight = _parse_channel_weights(args.pos_weight, config.LOSS_POS_WEIGHT,
+                                        "--pos-weight")
     bce_w = _parse_channel_weights(args.bce_weight, config.LOSS_BCE_W,
                                    "--bce-weight")
-    dice_w = _parse_channel_weights(args.dice_weight, config.LOSS_DICE_W,
+    # 单独训练 check 时默认打开 check 的 Dice：只给 BCE 会塌成全 1（见 train/readme）
+    dice_default = list(config.LOSS_DICE_W)
+    if task_ch == TASK_TO_CH["check_background"]:
+        dice_default[task_ch] = 1.0
+    dice_w = _parse_channel_weights(args.dice_weight, dice_default,
                                     "--dice-weight")
+    if task_ch is not None:
+        bce_w = (bce_w[task_ch],)
+        dice_w = (dice_w[task_ch],)
+        pos_weight = (pos_weight[task_ch],)
+        cldice_w = (config.LOSS_CLDICE_W[task_ch],)
+    else:
+        cldice_w = tuple(config.LOSS_CLDICE_W)
 
     # ---- 多卡（DDP）：torchrun 起才有 LOCAL_RANK，否则就是原来的单卡单进程 ----
     ddp = device_mod.Dist(cpu=args.cpu)
@@ -509,13 +540,13 @@ def main():
               f"与推理用的滑动平均对不上，会出现严重欠分割。请用 batch≥2 或把 "
               f"config.NORM 改成 'group'。")
     if args.arch == "unet++":
-        model = UNetPlusPlus(in_ch=3, out_ch=N_CH, norm=args.norm)
+        model = UNetPlusPlus(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     elif args.arch == "attention_unet":
-        model = AttentionUNet(in_ch=3, out_ch=N_CH, norm=args.norm)
+        model = AttentionUNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     elif args.arch == "swin_unet":
         # 延迟导入：Swin 依赖 timm/einops，没装的环境仍能跑其它骨架
         from common.swin_unet import SwinUNet2D, load_pretrained_encoder
-        model = SwinUNet2D(in_ch=3, out_ch=N_CH, img_size=arch_img_size,
+        model = SwinUNet2D(in_ch=3, out_ch=model_out_ch, img_size=arch_img_size,
                            norm=args.norm)
         # ImageNet 预训练编码器（默认开，--swin-pretrained none 关闭）。
         # **在包 DDP / 搬上 GPU 之前加载**：各 rank 从同一份 CPU 权重出发，结果一致。
@@ -531,7 +562,7 @@ def main():
     elif args.arch == "segformer":
         # 延迟导入：依赖 timm（DropPath 等），没装 timm 的环境仍能跑其它骨架
         from common.segformer import SegFormer2D, load_pretrained_segformer
-        model = SegFormer2D(in_ch=3, out_ch=N_CH,
+        model = SegFormer2D(in_ch=3, out_ch=model_out_ch,
                             variant=args.segformer_variant, norm=args.norm)
         # 可选预训练：官方 mmseg 权重（默认 none = 从零）
         if args.segformer_pretrained.lower() != "none":
@@ -546,7 +577,7 @@ def main():
     elif args.arch == "transunet":
         # 延迟导入：TransUNet 依赖 numpy（已装），不需要额外环境
         from common.transunet import TransUNet2D, load_pretrained_transunet
-        model = TransUNet2D(in_ch=3, out_ch=N_CH, img_size=arch_img_size,
+        model = TransUNet2D(in_ch=3, out_ch=model_out_ch, img_size=arch_img_size,
                             norm=args.norm,
                             use_checkpoint=not args.transunet_no_checkpoint)
         if args.transunet_pretrained.lower() != "none":
@@ -560,7 +591,7 @@ def main():
     elif args.arch == "sam":
         # 延迟导入；SAM 编码器 vendored 在 common/sam_seg.py，不依赖 segment_anything 包
         from common.sam_seg import SAMSeg2D, load_pretrained_sam
-        model = SAMSeg2D(in_ch=3, out_ch=N_CH, variant=args.sam_variant,
+        model = SAMSeg2D(in_ch=3, out_ch=model_out_ch, variant=args.sam_variant,
                          norm=args.norm, pretrained=None,
                          freeze_encoder=not args.sam_finetune_encoder)
         if args.sam_pretrained.lower() != "none":
@@ -575,7 +606,7 @@ def main():
     elif args.arch == "sam2":
         # 延迟导入；Hiera 编码器 vendored 在 common/sam2_seg.py
         from common.sam2_seg import SAM2Seg2D, load_pretrained_sam2
-        model = SAM2Seg2D(in_ch=3, out_ch=N_CH, variant=args.sam2_variant,
+        model = SAM2Seg2D(in_ch=3, out_ch=model_out_ch, variant=args.sam2_variant,
                           norm=args.norm, pretrained=None,
                           freeze_encoder=not args.sam2_finetune_encoder)
         if args.sam2_pretrained.lower() != "none":
@@ -590,7 +621,7 @@ def main():
     elif args.arch == "sam3":
         # 延迟导入；ViT-L + ViTDet neck 已 vendored 在 common/sam3_seg.py
         from common.sam3_seg import SAM3Seg2D, load_pretrained_sam3
-        model = SAM3Seg2D(in_ch=3, out_ch=N_CH, norm=args.norm,
+        model = SAM3Seg2D(in_ch=3, out_ch=model_out_ch, norm=args.norm,
                           pretrained=None,
                           freeze_encoder=not args.sam3_finetune_encoder)
         if args.sam3_pretrained.lower() != "none":
@@ -602,7 +633,7 @@ def main():
         elif not ddp.enabled or ddp.is_main:
             print("[SAM3] 从零训练（--sam3-pretrained 可指定官方权重）")
     else:
-        model = UNet(in_ch=3, out_ch=N_CH, norm=args.norm)
+        model = UNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
     # "SyncBatchNorm layers only work with GPU modules"
     if ddp.enabled and args.norm == "batch" and device.type == "cuda":
@@ -627,7 +658,9 @@ def main():
              if args.crop else f"整图缩放到长边 {args.size}")
           + f" | batch {args.batch}" + (f"×累积{args.accum}={eff_batch}"
                                        if args.accum > 1 else "")
-          + f" | 输出 {N_CH} 通道 {config.CLASS_NAMES}")
+          + f" | 输出 {model_out_ch} 通道 "
+          + (f"('{task_name}',)" if task_ch is not None
+             else str(config.CLASS_NAMES)))
     if args.crop and not args.workers:
         print("[警告] 切片训练下 num_workers=0 会让主进程同步切图+增强，GPU 空等。"
               "服务器上务必 --workers 8。")
@@ -644,9 +677,9 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     # 逐通道正样本加权，(1,C,1,1) 对应 (B,C,H,W) 的通道维（见 config.LOSS_POS_WEIGHT）
     pos_w = torch.as_tensor(pos_weight, dtype=torch.float32,
-                            device=device).view(1, N_CH, 1, 1)
+                            device=device).view(1, model_out_ch, 1, 1)
     # clDice 只对权重非零的通道计算（软骨架迭代贵，别浪费在茎/检查范围上）
-    cld_chans = [c for c, w in enumerate(config.LOSS_CLDICE_W)
+    cld_chans = [c for c, w in enumerate(cldice_w)
                  if w > 0.0] if config.CLDICE_ITERS > 0 else []
 
     # ---- 输出目录：model/model_年月日时分，重名追加 -1/-2… ----
@@ -657,13 +690,15 @@ def main():
     # 再把名字广播给其余 rank —— 它们虽然不写文件，但 hparams 里的 model_name 要一致。
     if ddp.enabled:
         folder_name = ddp.broadcast_object(
-            naming.model_folder_name(ts) if ddp.is_main else None)
-        folder = args.out_dir / folder_name
+            naming.model_folder_name(ts) + folder_suffix
+            if ddp.is_main else None)
+        folder = out_dir / folder_name
         if ddp.is_main:
             folder.mkdir(parents=True, exist_ok=True)
         ddp.barrier()
     else:
-        folder = naming.create_unique_dir(args.out_dir, naming.model_folder_name(ts))
+        folder = naming.create_unique_dir(
+            out_dir, naming.model_folder_name(ts) + folder_suffix)
     ckpt_path = folder / f"{folder.name}.pth"
     log_path = folder / f"{folder.name}_log.txt"
     hparams = {k: (str(v) if isinstance(v, Path) else v)
@@ -676,12 +711,15 @@ def main():
                     "ddp_backend": ddp.backend,
                     "val_names": val_names, "train_names": train_names,
                     "val_plants": val_plants, "train_plants": train_plants,
-                    "class_names": list(config.CLASS_NAMES), "out_ch": N_CH,
+                    "task": task,
+                    "class_names": ([task_name] if task_ch is not None
+                                    else list(config.CLASS_NAMES)),
+                    "out_ch": model_out_ch,
                     "norm": args.norm,
                     "loss_bce_w": list(bce_w),
                     "loss_dice_w": list(dice_w),
                     "loss_pos_weight": list(pos_weight),
-                    "loss_cldice_w": list(config.LOSS_CLDICE_W),
+                    "loss_cldice_w": list(cldice_w),
                     "cldice_iters": config.CLDICE_ITERS,
                     "params_M": round(n_params / 1e6, 2),
                     "start": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -710,12 +748,13 @@ def main():
         + f" | lr {args.lr} | "
         f"epochs {args.epochs} | 训练 {len(train_names)} 组 | "
         f"验证 {len(val_names)} 组({len(val_plants)} 植株)")
-    log(f"[信息] 通道 {config.CLASS_NAMES} | BCE权重 {bce_w} | "
-        f"Dice权重 {dice_w} | 正样本权重 {pos_weight}")
+    log(f"[信息] 任务 {task_name} | "
+        f"通道 {([task_name] if task_ch is not None else list(config.CLASS_NAMES))} | "
+        f"BCE权重 {bce_w} | Dice权重 {dice_w} | 正样本权重 {pos_weight}")
     log(f"[信息] 学习率 {args.lr} | 平台期 {args.lr_patience} 轮不减半就 ×{config.LR_FACTOR}"
         f"（下限 {config.MIN_LR}）| 早停 {args.patience} 轮")
     log(f"[信息] clDice 拓扑损失: "
-        + (f"通道 {cld_chans} 权重 {config.LOSS_CLDICE_W} iters {config.CLDICE_ITERS}"
+        + (f"通道 {cld_chans} 权重 {cldice_w} iters {config.CLDICE_ITERS}"
            if cld_chans else "关闭"))
     log(f"[信息] 模型目录: {folder}")
 
@@ -725,7 +764,7 @@ def main():
     bad_epochs = 0
     epoch, val_dice = 0, -1.0
     # 先摆一份默认值：第一轮验证之前就 Ctrl-C 的话，异常分支里要用到它们
-    per_ch_dice = [-1.0] * N_CH
+    per_ch_dice = [-1.0] * model_out_ch
     select_dice = -1.0
     score_hist = deque(maxlen=max(config.SELECT_SMOOTH, 1))
     t_start = time.time()
@@ -742,6 +781,10 @@ def main():
             n_micro = 0
             for i_batch, (x, y, batch_names, valid) in enumerate(loader):
                 x, y, valid = x.to(device), y.to(device), valid.to(device)
+                if task_ch is not None:
+                    # 单通道任务：只监督当前通道；模型输出也是 1 通道
+                    y = y[:, task_ch:task_ch + 1]
+                    valid = valid[:, task_ch:task_ch + 1]
                 sw = None
                 if use_src_w:
                     sw = torch.tensor([src_w_lut[n] for n in batch_names],
@@ -770,7 +813,7 @@ def main():
                     if cld_chans:
                         cd, dg = cldice_loss(prob.float(), y, config.CLDICE_ITERS,
                                              cld_chans)
-                        wc = channel_weights(config.LOSS_CLDICE_W, valid)[:, cld_chans]
+                        wc = channel_weights(cldice_w, valid)[:, cld_chans]
                         # 来源权重也要乘到 clDice 上（2026-10-18 补）：上面 BCE / Dice
                         # 都已乘 sw，这里漏掉的话 `--src-weight 0.3` 对伪标签的折扣
                         # 在拓扑项上完全失效 —— 一项按 0.3、一项按 1.0，等于没打对折。
@@ -803,7 +846,7 @@ def main():
 
             # ---- 验证（轮内）：逐通道 Dice/IoU，早停/保存按联合指标（见下面 select_dice）----
             val_dice = val_iou = -1.0
-            per_ch_dice = [-1.0] * N_CH
+            per_ch_dice = [-1.0] * model_out_ch
             if val_ds:
                 model.eval()
                 d_all, i_all = [], []
@@ -824,8 +867,13 @@ def main():
                                 .astype(np.uint8)
                             prob = _predict.tiled_probs(model, img, args.crop,
                                                         device=device)
-                            _accumulate(prob.numpy()[0] > 0.5, y.numpy() > 0.5,
-                                        valid.numpy(), d_all, i_all)
+                            pb = prob.numpy()[0] > 0.5
+                            gt = y.numpy() > 0.5
+                            vd = valid.numpy()
+                            if task_ch is not None:
+                                gt = gt[task_ch:task_ch + 1]
+                                vd = vd[task_ch:task_ch + 1]
+                            _accumulate(pb, gt, vd, d_all, i_all)
                 else:
                     with torch.no_grad():
                         for x, y, _, valid in val_loader:
@@ -833,8 +881,12 @@ def main():
                             with torch.autocast(device_type="cuda", enabled=amp):
                                 prob = torch.sigmoid(model(x)).float()
                             pb = prob.cpu().numpy() > 0.5
-                            gt = y.numpy() > 0.5
-                            vd = valid.numpy()
+                            if task_ch is not None:
+                                gt = y.numpy()[:, task_ch:task_ch + 1] > 0.5
+                                vd = valid.numpy()[:, task_ch:task_ch + 1]
+                            else:
+                                gt = y.numpy() > 0.5
+                                vd = valid.numpy()
                             for i in range(len(gt)):
                                 _accumulate(pb[i], gt[i], vd[i], d_all, i_all)
                 if d_all:
@@ -866,11 +918,16 @@ def main():
             # （实测：root 0.4075 / stem 0.4902 被选中，测试总长误差翻倍）。
             # 门槛常数的取值依据见 config.STEM_MIN_DICE。
             # 茎在验证集里没标注时 per_ch_dice[1] == -1，退回单看根系。
-            stem_dice = per_ch_dice[1] if N_CH > 1 else -1.0
-            if stem_dice >= 0.0:
-                score_now = val_dice * min(1.0, stem_dice / config.STEM_MIN_DICE)
-            else:
+            if task_ch is not None:
+                # 单通道任务：直接按当前通道 Dice 选模型，不再套茎门槛
                 score_now = val_dice
+                stem_dice = val_dice if task_ch == 1 else -1.0
+            else:
+                stem_dice = per_ch_dice[1] if N_CH > 1 else -1.0
+                if stem_dice >= 0.0:
+                    score_now = val_dice * min(1.0, stem_dice / config.STEM_MIN_DICE)
+                else:
+                    score_now = val_dice
             # 滑动平均：窗口 >1 才起作用，默认 1（试过 10，没有证据支持有用，
             # 见 config.SELECT_SMOOTH 里记的教训）
             score_hist.append(score_now)
@@ -890,9 +947,10 @@ def main():
                     torch.save({"state_dict": raw_model.state_dict(), "epoch": epoch,
                                 "val_dice": val_dice, "select_dice": select_dice,
                                 "stem_dice": stem_dice, "hparams": hparams,
-                                "out_ch": N_CH, "norm": args.norm,
-                                "arch": args.arch,
-                                "class_names": list(config.CLASS_NAMES)},
+                                "out_ch": model_out_ch, "norm": args.norm,
+                                "arch": args.arch, "task": task,
+                                "class_names": ([task_name] if task_ch is not None
+                                                else list(config.CLASS_NAMES))},
                                ckpt_path)
                 bad_epochs = 0
             else:
@@ -910,8 +968,11 @@ def main():
                     note = (f"\n[学习率] 联合 Dice 连续 {args.lr_patience} 轮未提升："
                             f"{cur_lr:.2e} → {new_lr:.2e}")
                     cur_lr = new_lr
-            extra = "".join(f" {n}_dice={d:.4f}"
-                            for n, d in zip(config.CLASS_NAMES, per_ch_dice))
+            if task_ch is not None:
+                extra = f" {task_name}_dice={per_ch_dice[0]:.4f}"
+            else:
+                extra = "".join(f" {n}_dice={d:.4f}"
+                                for n, d in zip(config.CLASS_NAMES, per_ch_dice))
             cd_str = ""
             if cld_chans:
                 n_all = cd_valid + cd_degen
@@ -930,7 +991,9 @@ def main():
                 + (" *best*" if improved else "") + note)
 
             if bad_epochs >= args.patience and epoch >= 10:
-                log(f"[提前停止] 连续 {args.patience} 轮联合 Dice 未提升，停止训练。")
+                metric_name = task_name if task_ch is not None else "联合"
+                log(f"[提前停止] 连续 {args.patience} 轮{metric_name} Dice 未提升，"
+                    f"停止训练。")
                 break
     except KeyboardInterrupt:
         log("[中断] 收到 Ctrl-C，保存已训练到当前轮的模型权重。")
@@ -938,18 +1001,24 @@ def main():
             torch.save({"state_dict": raw_model.state_dict(), "epoch": epoch,
                         "val_dice": val_dice,
                         "select_dice": select_dice,
-                        "stem_dice": per_ch_dice[1] if N_CH > 1 else -1.0,
+                        "stem_dice": (per_ch_dice[0] if task_ch == 1 else -1.0)
+                        if task_ch is not None
+                        else (per_ch_dice[1] if N_CH > 1 else -1.0),
                         "hparams": hparams,
-                        "out_ch": N_CH, "norm": args.norm,
-                        "arch": args.arch,
-                        "class_names": list(config.CLASS_NAMES)},
+                        "out_ch": model_out_ch, "norm": args.norm,
+                        "arch": args.arch, "task": task,
+                        "class_names": ([task_name] if task_ch is not None
+                                        else list(config.CLASS_NAMES))},
                        ckpt_path)
     finally:
         # 进程组一定要销毁：不然 DDP 的 NCCL 通信线程会吊着，进程退不干净
         ddp.close()
 
     total = time.time() - t_start
-    if best_epoch > 0:
+    if best_epoch > 0 and task_ch is not None:
+        log(f"[完成] 最佳轮次: epoch {best_epoch} | "
+            f"{task_name} Dice {best_select:.4f} | 模型已保存: {ckpt_path}")
+    elif best_epoch > 0:
         log(f"[完成] 最佳轮次: epoch {best_epoch} | 联合 Dice {best_select:.4f}"
             f"（根系 {best_root:.4f} / 茎 {best_stem:.4f}） | "
             f"模型已保存: {ckpt_path}")

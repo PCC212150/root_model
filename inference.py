@@ -379,6 +379,10 @@ def main():
     device = device_mod.pick(cpu=cpu, gpu=gpu)
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
     meta = metas[0]
+    if meta.get("task", "all") != "all":
+        sys.exit(f"[错误] 这个权重是单通道任务模型（task={meta['task']}）。"
+                 f"inference.py 目前只支持三通道联合模型；单通道推理工具待接入，"
+                 f"可先用 test/test_task.py 在测试集上评测")
     # 切片训练的模型走**原始分辨率滑窗**（见 ckpt.infer_tile 的实测对比）；0 = 老路径
     tile = ckpt.infer_tile(metas, size_arg)
     tag = f"集成 {len(names)} 个" if len(names) > 1 else "模型"

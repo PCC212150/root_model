@@ -70,7 +70,39 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/
 - TransUNet / SAM / SAM2 / SAM3：**不需要额外装包**——实现已 vendored 到 `common/`。
   注意 SAM 2/3 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
 
-### 1.6 checkpoint 与测试
+### 1.6 单通道任务（默认）与 `--task all`
+
+从 2026-10-25 起 `train.py` **默认 `--task root`**：只训练 root 一个通道，
+模型输出 1 通道。也可以单独训练另外两个通道：
+
+```bash
+# root（默认）
+python train/train.py --arch unet --task root ...
+# 输出目录：model/model_YYYYMMDDHHMM/
+
+# stem
+python train/train.py --arch unet --task stem ...
+# 输出目录：model/model_YYYYMMDDHHMM-stem/
+
+# check_background
+python train/train.py --arch unet --task check_background ...
+# 输出目录：model/model_YYYYMMDDHHMM-check_background/
+```
+
+- 单通道模型的损失权重、正样本权重、clDice 都只取当前通道：
+  root/ stem 的 Dice=1；check_background **默认也把 Dice 设为 1**
+  （只给 BCE 会塌成全 1）。
+- 选模型/早停/LR 只看当前通道 Dice，不再套 `STEM_MIN_DICE` 门槛。
+- 评测用：
+  ```bash
+  python test/test_task.py --model model_2026xxxxxxxx-stem --data-dir datasets/root/test/GT
+  ```
+- `--task all` 保留原来的**三通道联合模型**（输出 3 通道，旧行为）。要复现
+  2026-10-25 之前的实验，命令里必须显式加 `--task all`。
+- 单通道模型目前**没有**接入 `inference.py`（它依赖三通道的检查范围/根统计）；
+  部署时 root/stem 的 ROI 需要单独跑 check_background 模型，工具待接入。
+
+### 1.7 checkpoint 与测试
 
 每次训练生成 `model/model_YYYYMMDDHHMM/`：
 
@@ -90,6 +122,9 @@ python inference.py --model model_202610241829 --dir <图片文件夹> --size 15
 ---
 
 ## 2. 各网络操作细则
+
+> ⚠️ 下面的命令默认 `--task root`（单通道 root 模型）。要跑三通道联合模型，
+> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.10。
 
 ### 2.1 `--arch unet`（经典 U-Net，baseline）
 
@@ -241,7 +276,23 @@ torchrun --nproc_per_node=3 train/train.py \
   check 通道 BCE-only 塌成全 1，原因见 1.3 与 SAM2 一节）。
 - 官方 HF 仓库是 gated；下载走 ModelScope，见 pretrained_ckpt/README.md。
 
-### 2.10 nnU-Net（外部框架，不是 `--arch`）
+### 2.10 单通道 stem / check_background
+
+```bash
+# stem（所有骨架都支持，把 --arch 换成需要的即可）
+python train/train.py --arch unet --task stem --size 1536 --batch 1 --accum 4 \
+  --workers 2 --src-weight 0.3 --epochs 2000
+
+# check_background
+python train/train.py --arch unet --task check_background --size 1536 --batch 1 --accum 4 \
+  --workers 2 --src-weight 0.3 --epochs 2000
+```
+
+- 模型文件夹名自动加后缀：`-stem` / `-check_background`；root 不加。
+- 单通道模型用 `test/test_task.py` 评测，见 1.6。
+- check_background 单独训练时默认 Dice=1（否则模型会塌成全 1）。
+
+### 2.11 nnU-Net（外部框架，不是 `--arch`）
 
 nnU-Net 是完整框架（自己的 dataset 格式、plan/preprocess、5 折训练、预测），
 不能塞进 `--arch`。按 [tool/nnunet/README.md](../tool/nnunet/README.md) 走：

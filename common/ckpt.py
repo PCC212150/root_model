@@ -18,7 +18,7 @@ from common.unet_plusplus import UNetPlusPlus
 REQUIRED_CHANNELS = 3
 
 
-def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
+def load_unet(pth, device="cpu", require: int = None):
     """加载权重并构造 U-Net，返回 (model, meta)。
 
     require 不为 None 时校验通道数：旧版的单通道（只有根系）权重会明确报错退出，
@@ -59,6 +59,14 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
     # 骨架：unet / unet++。旧权重没有 arch 字段 -> 默认 unet（向后兼容）
     hp = ckpt.get("hparams") or {}
     arch = ckpt.get("arch") or hp.get("arch") or "unet"
+    # 任务：root / stem / check_background 是单通道模型；all（旧权重没有该字段）是三通道
+    task = ckpt.get("task") or hp.get("task") or "all"
+    if task == "all" and out_ch != len(config.CLASS_NAMES):
+        raise SystemExit(f"[错误] 权重 {pth.name} 标记为三通道联合模型，但输出是 "
+                         f"{out_ch} 通道")
+    if task != "all" and out_ch != 1:
+        raise SystemExit(f"[错误] 权重 {pth.name} 标记为单通道任务 {task!r}，但输出是 "
+                         f"{out_ch} 通道")
     if arch == "unet++":
         model = UNetPlusPlus(in_ch=3, out_ch=out_ch, norm=norm)
     elif arch == "attention_unet":
@@ -113,6 +121,7 @@ def load_unet(pth, device="cpu", require: int = REQUIRED_CHANNELS):
         "out_ch": out_ch,
         "norm": norm,
         "arch": arch,
+        "task": task,
         "arch_img_size": hp.get("arch_img_size"),
         "epoch": ckpt.get("epoch"),
         "val_dice": ckpt.get("val_dice"),
@@ -199,7 +208,7 @@ def resolve_pths(model_arg, root=None):
     return pths, names
 
 
-def load_models(pths, device="cpu", require: int = REQUIRED_CHANNELS):
+def load_models(pths, device="cpu", require: int = None):
     """加载一个或多个权重（集成用），返回 (models, metas)。
 
     集成要求所有模型训练时的输入长边一致：概率图必须在同一个网格上平均。不一致会直接
@@ -219,4 +228,8 @@ def load_models(pths, device="cpu", require: int = REQUIRED_CHANNELS):
     if len(crops) > 1:
         raise SystemExit(f"[错误] 不能把切片训练与整图缩放的模型混在一起集成"
                          f"（--crop 分别是 {crops}）：两者的尺度语义不同，概率图对不上。")
+    tasks = sorted({m.get("task", "all") for m in metas})
+    if len(tasks) > 1:
+        raise SystemExit(f"[错误] 不能把不同任务（{tasks}）的模型混在一起集成："
+                         f"单通道模型的输出通道不同，概率图对不上。")
     return models, metas

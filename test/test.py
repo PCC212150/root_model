@@ -92,6 +92,9 @@ def main():
         print(f"集成 {len(names)} 个: {' + '.join(names)}")
     model, metas = ckpt.load_models(pths, device)     # 集成时 model 是模型列表
     meta = metas[0]
+    if meta.get("task", "all") != "all":
+        sys.exit(f"[错误] 这个权重是单通道任务模型（task={meta['task']}），"
+                 f"请用 test/test_task.py --model <模型> 评测")
     # 切片训练的模型走**原始分辨率滑窗**（见 ckpt.infer_tile 的实测对比）；0 = 老路径
     tile = ckpt.infer_tile(metas, args.size)
     print(f"权重: {pth.name} (保存于 epoch {meta.get('epoch', '?')}"
