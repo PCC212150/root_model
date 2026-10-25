@@ -39,7 +39,7 @@
   SyncBatchNorm，因此每卡 batch=1 也可用（全局统计量跨卡同步）。
 - `--norm group` 不依赖 batch 统计量，但显存比 BatchNorm 高约一倍。
 - 显存不够时优先降 `--size`，其次用 `--accum` 换等效 batch（不能救 BatchNorm 的 batch=1）。
-- ⚠️ **冻结骨干的模型（sam / sam2 / sam3）建议用 `--norm group`**：解码头只有
+- ⚠️ **冻结骨干的模型（sam / sam2 / sam3 / medsam）建议用 `--norm group`**：解码头只有
   BatchNorm 时，训练用 batch 统计量、验证/测试用滑动平均，batch=1（含 DDP 每卡 1 张）
   下两者差异很大，实测 SAM2 的 check 通道在 eval 模式直接塌成全 1
   （val check Dice 恒定 0.7847）。GroupNorm 训练/推理行为一致。
@@ -67,7 +67,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/
 
 - U-Net / UNet++ / Attention U-Net：torch 即可。
 - Swin-Unet：`pip install timm einops`；SegFormer：`timm`（装过 Swin 的 einops 就不用了）。
-- TransUNet / SAM / SAM2 / SAM3：**不需要额外装包**——实现已 vendored 到 `common/`。
+- TransUNet / SAM / SAM2 / SAM3 / MedSAM：**不需要额外装包**——实现已 vendored 到 `common/`。
   注意 SAM 2/3 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
 
 ### 1.6 单通道任务（默认）与 `--task all`
@@ -284,7 +284,27 @@ torchrun --nproc_per_node=3 train/train.py \
   check 通道 BCE-only 塌成全 1，原因见 1.3 与 SAM2 一节）。
 - 官方 HF 仓库是 gated；下载走 ModelScope，见 pretrained_ckpt/README.md。
 
-### 2.10 单通道 stem / check_background
+### 2.10 `--arch medsam`（MedSAM ViT-B 编码器 + 监督解码头）
+
+```bash
+torchrun --nproc_per_node=3 train/train.py \
+  --arch medsam --size 1536 --batch 1 --accum 4 --workers 2 --src-weight 0.3 --epochs 2000 \
+  --norm group --dice-weight 1,1,1
+```
+
+- MedSAM = 在医学图像上微调过的 SAM ViT-B（Ma et al., Nat. Commun. 2024）。
+  和 `--arch sam` 一样**不是 promptable 零样本**：只取图像编码器，接监督解码头；
+  MedSAM 原版的 prompt encoder / mask decoder 不使用（我们没有框/点提示来源）。
+- 与 `--arch sam` 的区别是**预处理和权重**：MedSAM 按图做 min-max 到 [0,1]，
+  不减 ImageNet 均值；默认加载 `pretrained_ckpt/medsam_vit_b.pth`。
+- 总参数 **90.24M**，默认冻结编码器，可训练 **0.57M**；显存与 SAM1 接近（约 5.6GB）。
+- 关闭预训练：`--medsam-pretrained none`；解冻编码器：`--medsam-finetune-encoder`
+  （默认不推荐，71 张图容易过拟合）。
+- 同样建议 `--norm group --dice-weight 1,1,1`（冻结骨干 + batch1 的 check 塌陷问题，
+  见 1.3 与 SAM2 一节）。
+- 权重下载见 [pretrained_ckpt/README.md](../pretrained_ckpt/README.md)。
+
+### 2.11 单通道 stem / check_background
 
 ```bash
 # stem（所有骨架都支持，把 --arch 换成需要的即可）
@@ -300,7 +320,7 @@ python train/train.py --arch unet --task check_background --size 1536 --batch 1 
 - 单通道模型用 `test/test_task.py` 评测，见 1.6。
 - check_background 单独训练时默认 Dice=1（否则模型会塌成全 1）。
 
-### 2.11 nnU-Net（外部框架，不是 `--arch`）
+### 2.12 nnU-Net（外部框架，不是 `--arch`）
 
 nnU-Net 是完整框架（自己的 dataset 格式、plan/preprocess、5 折训练、预测），
 不能塞进 `--arch`。按 [tool/nnunet/README.md](../tool/nnunet/README.md) 走：
@@ -326,6 +346,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `sam` | ✓ | 建议 %16 | ✓ | SA-1B ViT-B | 90.24M / **0.57M** | 5.6GB |
 | `sam2` | ✓ | 建议 %16 | ✓ | SAM 2.1 Hiera-T | 28.23M / **1.01M** | 1.4GB |
 | `sam3` | ✓ | 建议 %16 | ✓ | SAM 3 ViT-L | 455.12M / **1.08M** | 2.1GB |
+| `medsam` | ✓ | 建议 %16 | ✓ | MedSAM ViT-B | 90.24M / **0.57M** | ~5.6GB |
 
 \* 本机 RTX 5060（8GB，batch1，前向+反向）。8GB 卡上的数字超过 8GB 时会发生共享内存
 回退、速度变慢但未必 OOM；3090（24GB）上实际更快、更宽裕。UNet++ 是唯一需要在

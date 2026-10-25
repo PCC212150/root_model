@@ -43,6 +43,13 @@ SAM_PRETRAINED_CKPT = PRETRAINED_DIR / "sam_vit_b_01ec64.pth"
 SAM_PRETRAINED_URL = ("https://dl.fbaipublicfiles.com/segment_anything/"
                       "sam_vit_b_01ec64.pth")
 
+# MedSAM（医学图像上微调的 SAM ViT-B，约 375MB）。官方发布在 Google Drive 文件夹，
+# 下面是 medsam_vit_b.pth 的直链；和 SAM 一样只用图像编码器 + 监督解码头。
+# 官方目录: https://drive.google.com/drive/folders/1ETWmi4AiniJeWOt6HAsYgTjYv_fkgzoN
+MEDSAM_PRETRAINED_CKPT = PRETRAINED_DIR / "medsam_vit_b.pth"
+MEDSAM_PRETRAINED_URL = ("https://drive.usercontent.google.com/download?"
+                         "id=1UAmWL88roYR7wKlnApw5Bcuzf2iQgk6_&export=download&confirm=t")
+
 # SAM 2.1 Hiera 图像编码器（tiny 约 149MB）。与 SAM1 一样只用编码器 + 监督解码头。
 # 其它变体的下载地址把文件名换成 sam2.1_hiera_{small,base_plus,large}.pt 即可。
 SAM2_PRETRAINED_CKPT = PRETRAINED_DIR / "sam2.1_hiera_tiny.pt"

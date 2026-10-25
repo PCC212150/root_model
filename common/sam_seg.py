@@ -277,10 +277,14 @@ class SAMSeg2D(nn.Module):
 
     def __init__(self, in_ch: int = 3, out_ch: int = 3,
                  variant: str = "vit_b", norm: str = "batch",
-                 pretrained=None, freeze_encoder: bool = True):
+                 pretrained=None, freeze_encoder: bool = True,
+                 norm_mode: str = "sam"):
         super().__init__()
         if variant not in VARIANTS:
             raise ValueError(f"未知 SAM 变体 {variant!r}，可选 {sorted(VARIANTS)}")
+        if norm_mode not in ("sam", "medsam"):
+            raise ValueError(f"未知归一化方式 {norm_mode!r}，可选 sam / medsam")
+        self.norm_mode = norm_mode
         embed_dim, depth, num_heads, global_idx = VARIANTS[variant]
         self.variant = variant
         self.image_encoder = ImageEncoderViT(
@@ -296,6 +300,11 @@ class SAMSeg2D(nn.Module):
                              torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1))
         self.register_buffer("pixel_std",
                              torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1))
+        if norm_mode == "medsam":
+            # MedSAM 官方预处理：缩放到 1024 后按图做 min-max 到 [0,1]，
+            # 不再减 ImageNet 均值 / 除标准差（见 Net/MedSAM/MedSAM_Inference.py）
+            self.pixel_mean.zero_()
+            self.pixel_std.fill_(1.0)
         if pretrained is not None:
             load_pretrained_sam(self, pretrained)
         self.freeze_encoder = bool(freeze_encoder)
@@ -312,7 +321,13 @@ class SAMSeg2D(nn.Module):
         return self
 
     def forward(self, x):
-        x = (x * 255.0 - self.pixel_mean) / self.pixel_std
+        if self.norm_mode == "medsam":
+            # 项目输入已是 [0,1]；按图 min-max，与 MedSAM 训练/推理的预处理一致
+            mn = x.amin(dim=(1, 2, 3), keepdim=True)
+            mx = x.amax(dim=(1, 2, 3), keepdim=True)
+            x = (x - mn) / (mx - mn).clamp_min(1e-8)
+        else:
+            x = (x * 255.0 - self.pixel_mean) / self.pixel_std
         if self.freeze_encoder:
             with torch.no_grad():
                 feat = self.image_encoder(x)
@@ -325,20 +340,37 @@ class SAMSeg2D(nn.Module):
         return logits
 
 
-def load_pretrained_sam(model, ckpt_path, verbose: bool = True):
-    """加载官方 SAM checkpoint 里的**图像编码器**权重。
+class MedSAMSeg2D(SAMSeg2D):
+    """MedSAM（医学图像上微调的 SAM ViT-B，Ma et al., Nat. Commun. 2024）。
 
-    官方文件是完整 `Sam.state_dict()`，键名以 `image_encoder.` 开头；
-    也兼容裸 `ImageEncoderViT` 权重（没有前缀）。prompt/mask decoder 忽略。
-    编码器键必须全部命中，否则报错（避免张冠李戴）。
+    与 ``SAMSeg2D`` 的唯一区别是预处理和默认权重：
+
+    - 输入按图 min-max 到 [0,1]（MedSAM 官方做法），不减 ImageNet 均值；
+    - 权重用官方 ``medsam_vit_b.pth``（同样是 SAM 格式，只取
+      ``image_encoder.*``）。
+
+    仍然只训练监督解码头；MedSAM 原版的 prompt encoder / mask decoder 不使用，
+    原因见模块开头（本项目没有可用的框/点提示来源）。
     """
+
+    def __init__(self, in_ch: int = 3, out_ch: int = 3, norm: str = "batch",
+                 pretrained=None, freeze_encoder: bool = True):
+        super().__init__(in_ch=in_ch, out_ch=out_ch, variant="vit_b", norm=norm,
+                         pretrained=None, freeze_encoder=freeze_encoder,
+                         norm_mode="medsam")
+        if pretrained is not None:
+            load_pretrained_medsam(self, pretrained)
+
+
+def _load_sam_encoder(model, ckpt_path, label: str, url: str,
+                      verbose: bool = True):
+    """从 SAM 格式 checkpoint 里取图像编码器权重（MedSAM 也是这个格式）。"""
     ckpt_path = Path(ckpt_path)
     if not ckpt_path.is_file():
-        import config
         raise SystemExit(
-            f"[错误] 找不到 SAM 预训练权重: {ckpt_path}\n"
-            f"       下载: curl -L -o \"{ckpt_path}\" {config.SAM_PRETRAINED_URL}\n"
-            f"       或加 --sam-pretrained none 从零训练")
+            f"[错误] 找不到 {label} 预训练权重: {ckpt_path}\n"
+            f"       下载: curl -L -o \"{ckpt_path}\" \"{url}\"\n"
+            f"       或加 --{label.lower()}-pretrained none 从零训练")
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     if isinstance(sd, dict) and isinstance(sd.get("model"), dict):
         sd = sd["model"]
@@ -351,10 +383,29 @@ def load_pretrained_sam(model, ckpt_path, verbose: bool = True):
     missing, unexpected = model.image_encoder.load_state_dict(enc, strict=False)
     if missing:
         raise SystemExit(
-            f"[错误] SAM 权重与图像编码器不匹配：缺少 {len(missing)} 个键，"
+            f"[错误] {label} 权重与图像编码器不匹配：缺少 {len(missing)} 个键，"
             f"例如 {missing[:5]}")
     if verbose:
         n = sum(p.numel() for p in model.image_encoder.parameters())
-        print(f"[SAM 预训练] {ckpt_path.name}: 图像编码器 {len(enc)} 个张量 / "
+        print(f"[{label} 预训练] {ckpt_path.name}: 图像编码器 {len(enc)} 个张量 / "
               f"{n / 1e6:.2f}M 参数 | 忽略 prompt/mask decoder")
     return {"encoder_tensors": len(enc), "unexpected": len(unexpected)}
+
+
+def load_pretrained_sam(model, ckpt_path, verbose: bool = True):
+    """加载官方 SAM checkpoint 里的图像编码器权重。
+
+    官方文件是完整 `Sam.state_dict()`，键名以 `image_encoder.` 开头；
+    也兼容裸 `ImageEncoderViT` 权重（没有前缀）。prompt/mask decoder 忽略。
+    编码器键必须全部命中，否则报错（避免张冠李戴）。
+    """
+    import config
+    return _load_sam_encoder(model, ckpt_path, "SAM",
+                             config.SAM_PRETRAINED_URL, verbose)
+
+
+def load_pretrained_medsam(model, ckpt_path, verbose: bool = True):
+    """加载官方 MedSAM `medsam_vit_b.pth` 里的图像编码器权重。"""
+    import config
+    return _load_sam_encoder(model, ckpt_path, "MedSAM",
+                             config.MEDSAM_PRETRAINED_URL, verbose)

@@ -109,12 +109,16 @@ def load_unet(pth, device="cpu", require: int = None):
     elif arch == "sam3":
         from common.sam3_seg import SAM3Seg2D
         model = SAM3Seg2D(in_ch=3, out_ch=out_ch, norm=norm, pretrained=None)
+    elif arch == "medsam":
+        # MedSAM ViT-B 与 SAM 共用编码器实现，只是 forward 里的预处理不同
+        from common.sam_seg import MedSAMSeg2D
+        model = MedSAMSeg2D(in_ch=3, out_ch=out_ch, norm=norm, pretrained=None)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
                          f"（只支持 unet / unet++ / attention_unet / swin_unet / "
-                         f"segformer / transunet / sam / sam2 / sam3）")
+                         f"segformer / transunet / sam / sam2 / sam3 / medsam）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {

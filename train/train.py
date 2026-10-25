@@ -235,7 +235,7 @@ def parse_args():
     p.add_argument("--dice-weight", default=None,
                    help="逐通道 Dice 损失权重，逗号分隔、顺序同 CLASS_NAMES"
                         "（默认见 config.LOSS_DICE_W，当前 check=0）。"
-                        "check 通道只有 BCE、没有 Dice 时，容易在 60~76% 前景下塌成全 1；"
+                        "check 通道只有 BCE、没有 Dice 时，容易在 60~76%% 前景下塌成全 1；"
                         "做 SAM 系列时可试 1,1,1")
     p.add_argument("--data-dir", type=Path, default=config.TRAIN_DATA_DIR)
     p.add_argument("--task", default="root",
@@ -253,7 +253,8 @@ def parse_args():
                         "（需 batch≥2，默认见 config.NORM）")
     p.add_argument("--arch", default="unet",
                    choices=("unet", "unet++", "attention_unet", "swin_unet",
-                            "segformer", "transunet", "sam", "sam2", "sam3"),
+                            "segformer", "transunet", "sam", "sam2", "sam3",
+                            "medsam"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
@@ -272,7 +273,10 @@ def parse_args():
                         "--sam2-pretrained none 关闭）；"
                         "sam3=SAM 3 ViT-L/14 视觉骨干（默认冻结）+ ViTDet neck + "
                         "监督解码头（common/sam3_seg.py，内部缩放到 1008x1008；"
-                        "默认加载 ModelScope 的 sam3.pt，--sam3-pretrained none 关闭）。"
+                        "默认加载 ModelScope 的 sam3.pt，--sam3-pretrained none 关闭）；"
+                        "medsam=MedSAM 医学微调的 SAM ViT-B 编码器（默认冻结）+ "
+                        "监督解码头（common/sam_seg.py，按图 min-max 预处理；默认加载 "
+                        "medsam_vit_b.pth，--medsam-pretrained none 关闭）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
@@ -316,6 +320,13 @@ def parse_args():
     p.add_argument("--sam3-finetune-encoder", action="store_true",
                    help="解冻 SAM 3 ViT-L 编码器一起训练（默认冻结；455M 参数，"
                         "解冻后显存会大幅上升，71 张图也不建议）")
+    p.add_argument("--medsam-pretrained", default=str(config.MEDSAM_PRETRAINED_CKPT),
+                   help="MedSAM 官方 medsam_vit_b.pth 路径（默认见 "
+                        "config.MEDSAM_PRETRAINED_CKPT）；none=从零训练。"
+                        "只对 --arch medsam 生效；只加载图像编码器")
+    p.add_argument("--medsam-finetune-encoder", action="store_true",
+                   help="解冻 MedSAM ViT-B 编码器一起训练（默认冻结；约 90M 参数，"
+                        "71 张图从零微调容易过拟合）")
     p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
                    help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
                         "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
@@ -632,6 +643,20 @@ def main():
                                  verbose=(not ddp.enabled or ddp.is_main))
         elif not ddp.enabled or ddp.is_main:
             print("[SAM3] 从零训练（--sam3-pretrained 可指定官方权重）")
+    elif args.arch == "medsam":
+        # 延迟导入；MedSAM ViT-B 与 SAM 共用编码器实现，只是预训练和预处理不同
+        from common.sam_seg import MedSAMSeg2D, load_pretrained_medsam
+        model = MedSAMSeg2D(in_ch=3, out_ch=model_out_ch, norm=args.norm,
+                            pretrained=None,
+                            freeze_encoder=not args.medsam_finetune_encoder)
+        if args.medsam_pretrained.lower() != "none":
+            ckpt_path = Path(args.medsam_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            load_pretrained_medsam(model, ckpt_path,
+                                   verbose=(not ddp.enabled or ddp.is_main))
+        elif not ddp.enabled or ddp.is_main:
+            print("[MedSAM] 从零训练（--medsam-pretrained 可指定官方权重）")
     else:
         model = UNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报

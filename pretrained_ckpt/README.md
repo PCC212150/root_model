@@ -5,6 +5,7 @@
 | Swin-Unet | `swin_tiny_patch4_window7_224.pth` | 114342173 B | `--arch swin_unet` 默认加载（ImageNet-1K Swin-T） |
 | TransUNet | `R50+ViT-B_16.npz` | 461217452 B | `--arch transunet` 默认加载（ImageNet-21k R50+ViT-B/16） |
 | SAM | `sam_vit_b_01ec64.pth` | 375042383 B | `--arch sam` 默认加载（SA-1B ViT-B 图像编码器） |
+| MedSAM | `medsam_vit_b.pth` | 375049145 B | `--arch medsam` 默认加载（医学微调 ViT-B 图像编码器） |
 | SAM 2 | `sam2.1_hiera_tiny.pt` | 156008466 B | `--arch sam2` 默认加载（Hiera-Tiny trunk+neck） |
 | SAM 3 | `sam3.pt` | 3450062241 B | `--arch sam3` 默认加载（ViT-L/14 视觉骨干 + ViTDet neck） |
 
@@ -50,6 +51,24 @@ curl -L -o sam_vit_b_01ec64.pth \
 prompt encoder 与 mask decoder 在本项目中不使用（我们是三通道监督分割，
 没有点/框提示来源，见 `common/sam_seg.py` 的说明）。
 `--sam-pretrained none` 可关闭预训练；`--sam-variant vit_l/vit_h` 可选更大编码器。
+
+## MedSAM ViT-B
+
+`medsam_vit_b.pth`，375049145 B，md5 `3bb6db55bd0c9ca30b61248bca72f8d6`。
+
+官方发布在 Google Drive 文件夹
+<https://drive.google.com/drive/folders/1ETWmi4AiniJeWOt6HAsYgTjYv_fkgzoN>；
+`medsam_vit_b.pth` 的直链：
+
+```bash
+curl -L -o medsam_vit_b.pth \
+  "https://drive.usercontent.google.com/download?id=1UAmWL88roYR7wKlnApw5Bcuzf2iQgk6_&export=download&confirm=t"
+```
+
+只取 `image_encoder.*`（与 SAM 相同的 177 个张量 / 89.67M 参数）。
+与 SAM 的区别：MedSAM 的预处理是**按图 min-max 到 [0,1]**，不减 ImageNet 均值，
+`MedSAMSeg2D` 的 forward 已按这个口径实现。`--medsam-pretrained none` 可关闭
+预训练；`--medsam-finetune-encoder` 解冻编码器（默认冻结）。
 
 ## SAM 2.1 Hiera-Tiny
 
