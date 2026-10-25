@@ -113,12 +113,17 @@ def load_unet(pth, device="cpu", require: int = None):
         # MedSAM ViT-B 与 SAM 共用编码器实现，只是 forward 里的预处理不同
         from common.sam_seg import MedSAMSeg2D
         model = MedSAMSeg2D(in_ch=3, out_ch=out_ch, norm=norm, pretrained=None)
+    elif arch == "umamba":
+        # 纯 PyTorch U-Mamba_Bot 2D（9 级残差 U-Net + 最深层 Mamba）
+        from common.umamba import UMambaBot2D
+        model = UMambaBot2D(in_ch=3, out_ch=out_ch, norm=norm)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
                          f"（只支持 unet / unet++ / attention_unet / swin_unet / "
-                         f"segformer / transunet / sam / sam2 / sam3 / medsam）")
+                         f"segformer / transunet / sam / sam2 / sam3 / medsam / "
+                         f"umamba）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {

@@ -254,7 +254,7 @@ def parse_args():
     p.add_argument("--arch", default="unet",
                    choices=("unet", "unet++", "attention_unet", "swin_unet",
                             "segformer", "transunet", "sam", "sam2", "sam3",
-                            "medsam"),
+                            "medsam", "umamba"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
@@ -276,7 +276,10 @@ def parse_args():
                         "默认加载 ModelScope 的 sam3.pt，--sam3-pretrained none 关闭）；"
                         "medsam=MedSAM 医学微调的 SAM ViT-B 编码器（默认冻结）+ "
                         "监督解码头（common/sam_seg.py，按图 min-max 预处理；默认加载 "
-                        "medsam_vit_b.pth，--medsam-pretrained none 关闭）。"
+                        "medsam_vit_b.pth，--medsam-pretrained none 关闭）；"
+                        "umamba=U-Mamba_Bot 2D（common/umamba.py，9 级残差 U-Net + "
+                        "最深层纯 PyTorch Mamba；不需要 mamba_ssm/CUDA 扩展；内部 "
+                        "pad 到 256 的倍数）。"
                         "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
@@ -657,6 +660,10 @@ def main():
                                    verbose=(not ddp.enabled or ddp.is_main))
         elif not ddp.enabled or ddp.is_main:
             print("[MedSAM] 从零训练（--medsam-pretrained 可指定官方权重）")
+    elif args.arch == "umamba":
+        # 纯 PyTorch 的 U-Mamba_Bot 2D；不需要 mamba_ssm / CUDA 扩展
+        from common.umamba import UMambaBot2D
+        model = UMambaBot2D(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     else:
         model = UNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报

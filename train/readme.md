@@ -67,7 +67,8 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/
 
 - U-Net / UNet++ / Attention U-Net：torch 即可。
 - Swin-Unet：`pip install timm einops`；SegFormer：`timm`（装过 Swin 的 einops 就不用了）。
-- TransUNet / SAM / SAM2 / SAM3 / MedSAM：**不需要额外装包**——实现已 vendored 到 `common/`。
+- TransUNet / SAM / SAM2 / SAM3 / MedSAM / U-Mamba：**不需要额外装包**——实现已
+  vendored 到 `common/`（U-Mamba 的 Mamba 是纯 PyTorch 实现，不依赖 `mamba_ssm`）。
   注意 SAM 2/3 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
 
 ### 1.6 单通道任务（默认）与 `--task all`
@@ -132,7 +133,7 @@ python inference.py --model model_202610241829 --dir <图片文件夹> --size 15
 ## 2. 各网络操作细则
 
 > ⚠️ 下面的命令默认 `--task root`（单通道 root 模型）。要跑三通道联合模型，
-> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.10。
+> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.12。
 
 ### 2.1 `--arch unet`（经典 U-Net，baseline）
 
@@ -304,7 +305,26 @@ torchrun --nproc_per_node=3 train/train.py \
   见 1.3 与 SAM2 一节）。
 - 权重下载见 [pretrained_ckpt/README.md](../pretrained_ckpt/README.md)。
 
-### 2.11 单通道 stem / check_background
+### 2.11 `--arch umamba`（U-Mamba_Bot 2D）
+
+```bash
+torchrun --nproc_per_node=3 train/train.py \
+  --arch umamba --size 1536 --batch 1 --accum 4 --workers 2 --src-weight 0.3 --epochs 2000
+```
+
+- 官方 U-Mamba（Ma et al., 2024）的 2D **Bot** 变体：9 级残差 U-Net，最深层接 Mamba。
+- **不需要 `mamba_ssm` / CUDA 扩展**：[common/umamba.py](../common/umamba.py) 用纯
+  PyTorch 逐步 selective scan 实现。Mamba 只在最深层做，1536×1024 输入时只有
+  6×4=24 个 token，逐步循环开销很小。U-Mamba_Enc 在浅层也有 Mamba（上百万 token），
+  本实现未提供。
+- 归一化跟随 `--norm`（官方用 InstanceNorm）；输入 H/W 不要求是 256 的倍数，
+  forward 内部 replicate-pad、输出再裁回原尺寸。
+- 总参数 **88.55M**；1024×1536 batch1 前向+反向约 **8.5GB**（本机 RTX 5060 8GB
+  靠共享内存跑通，3090 更宽裕）。`--size 2048` 显存会明显上升，先按 1536 跑。
+- 全卷积、支持 `--crop`；结构和 nnUNetPlans 的 2D 配置对齐（9 级、特征 32..512、
+  后半段每级 1 个 block），但训练/损失走本项目同一套。
+
+### 2.12 单通道 stem / check_background
 
 ```bash
 # stem（所有骨架都支持，把 --arch 换成需要的即可）
@@ -320,7 +340,7 @@ python train/train.py --arch unet --task check_background --size 1536 --batch 1 
 - 单通道模型用 `test/test_task.py` 评测，见 1.6。
 - check_background 单独训练时默认 Dice=1（否则模型会塌成全 1）。
 
-### 2.12 nnU-Net（外部框架，不是 `--arch`）
+### 2.13 nnU-Net（外部框架，不是 `--arch`）
 
 nnU-Net 是完整框架（自己的 dataset 格式、plan/preprocess、5 折训练、预测），
 不能塞进 `--arch`。按 [tool/nnunet/README.md](../tool/nnunet/README.md) 走：
@@ -347,6 +367,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `sam2` | ✓ | 建议 %16 | ✓ | SAM 2.1 Hiera-T | 28.23M / **1.01M** | 1.4GB |
 | `sam3` | ✓ | 建议 %16 | ✓ | SAM 3 ViT-L | 455.12M / **1.08M** | 2.1GB |
 | `medsam` | ✓ | 建议 %16 | ✓ | MedSAM ViT-B | 90.24M / **0.57M** | ~5.6GB |
+| `umamba` | ✓ | 内部 pad 到 %256 | ✓ | 无 | 88.55M / 88.55M | ~8.5GB |
 
 \* 本机 RTX 5060（8GB，batch1，前向+反向）。8GB 卡上的数字超过 8GB 时会发生共享内存
 回退、速度变慢但未必 OOM；3090（24GB）上实际更快、更宽裕。UNet++ 是唯一需要在
