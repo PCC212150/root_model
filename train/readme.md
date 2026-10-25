@@ -67,8 +67,9 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/
 
 - U-Net / UNet++ / Attention U-Net：torch 即可。
 - Swin-Unet：`pip install timm einops`；SegFormer：`timm`（装过 Swin 的 einops 就不用了）。
-- TransUNet / SAM / SAM2 / SAM3 / MedSAM / U-Mamba：**不需要额外装包**——实现已
-  vendored 到 `common/`（U-Mamba 的 Mamba 是纯 PyTorch 实现，不依赖 `mamba_ssm`）。
+- TransUNet / SAM / SAM2 / SAM3 / MedSAM / U-Mamba / Mask2Former：**不需要额外装包**
+  ——实现已 vendored 到 `common/`（U-Mamba 的 Mamba、Mask2Former 的 deformable
+  attention 都是纯 PyTorch 实现，不依赖 `mamba_ssm` / detectron2）。
   注意 SAM 2/3 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
 
 ### 1.6 单通道任务（默认）与 `--task all`
@@ -133,7 +134,7 @@ python inference.py --model model_202610241829 --dir <图片文件夹> --size 15
 ## 2. 各网络操作细则
 
 > ⚠️ 下面的命令默认 `--task root`（单通道 root 模型）。要跑三通道联合模型，
-> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.12。
+> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.13。
 
 ### 2.1 `--arch unet`（经典 U-Net，baseline）
 
@@ -324,7 +325,27 @@ torchrun --nproc_per_node=3 train/train.py \
 - 全卷积、支持 `--crop`；结构和 nnUNetPlans 的 2D 配置对齐（9 级、特征 32..512、
   后半段每级 1 个 block），但训练/损失走本项目同一套。
 
-### 2.12 单通道 stem / check_background
+### 2.12 `--arch mask2former`（Mask2Former 简化版）
+
+```bash
+torchrun --nproc_per_node=3 train/train.py \
+  --arch mask2former --size 1536 --batch 1 --accum 4 --workers 2 \
+  --src-weight 0.3 --epochs 2000 --norm group
+```
+
+- 官方 Mask2Former 依赖 detectron2 + 编译版 MultiScaleDeformableAttention；
+  [common/mask2former.py](../common/mask2former.py) 是自包含简化版：
+  ResNet-18 风格骨干 + FPN + 3 层 query-based mask 解码器（100 queries），
+  deformable attention 用纯 PyTorch `grid_sample` 实现。
+- **不是官方完整训练协议**：没有匈牙利匹配/集合损失，也没有 masked attention；
+  把 query 的 mask 按 class 做 softmax 加权后直接接项目现有 BCE+Dice 损失。
+  多标签 root/stem/check 各 class 独立加权。
+- 总参数 **19.52M**；1024×1536 batch1 前向+反向约 **3.3GB**。
+- 全卷积、支持 `--crop`；输入内部 pad 到 32 的倍数，输出裁回。
+- 从零训练，不加载 COCO/ADE 预训练权重。
+- 小尺寸 256 下 20 轮验证 Dice 约 0.19，属于正常起步；最终效果看 1536/2000 轮。
+
+### 2.13 单通道 stem / check_background
 
 ```bash
 # stem（所有骨架都支持，把 --arch 换成需要的即可）
@@ -340,7 +361,7 @@ python train/train.py --arch unet --task check_background --size 1536 --batch 1 
 - 单通道模型用 `test/test_task.py` 评测，见 1.6。
 - check_background 单独训练时默认 Dice=1（否则模型会塌成全 1）。
 
-### 2.13 nnU-Net（外部框架，不是 `--arch`）
+### 2.14 nnU-Net（外部框架，不是 `--arch`）
 
 nnU-Net 是完整框架（自己的 dataset 格式、plan/preprocess、5 折训练、预测），
 不能塞进 `--arch`。按 [tool/nnunet/README.md](../tool/nnunet/README.md) 走：
@@ -368,6 +389,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `sam3` | ✓ | 建议 %16 | ✓ | SAM 3 ViT-L | 455.12M / **1.08M** | 2.1GB |
 | `medsam` | ✓ | 建议 %16 | ✓ | MedSAM ViT-B | 90.24M / **0.57M** | ~5.6GB |
 | `umamba` | ✓ | 内部 pad 到 %256 | ✓ | 无 | 88.55M / 88.55M | ~8.5GB |
+| `mask2former` | ✓ | 内部 pad 到 %32 | ✓ | 无 | 19.52M / 19.52M | ~3.3GB |
 
 \* 本机 RTX 5060（8GB，batch1，前向+反向）。8GB 卡上的数字超过 8GB 时会发生共享内存
 回退、速度变慢但未必 OOM；3090（24GB）上实际更快、更宽裕。UNet++ 是唯一需要在

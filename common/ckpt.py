@@ -35,18 +35,20 @@ def load_unet(pth, device="cpu", require: int = None):
     sd = ckpt["state_dict"]
     # 输出层的键名随骨架不同：UNet/UNet++/AttentionUNet 是 out.weight；
     # Swin-Unet 是 SwinUNet2D.model.output.weight；
-    # SegFormer 的解码分类头是 decode_head.linear_pred.weight。
+    # SegFormer 的解码分类头是 decode_head.linear_pred.weight；
+    # Mask2Former 的类别头是 class_head.weight，形状 [out_ch, d_model]。
     out_key = next((k for k in ("out.weight", "output.weight",
                                 "model.output.weight",
                                 "decode_head.linear_pred.weight",
                                 "model.segmentation_head.0.weight",
-                                "decoder.out.weight")
+                                "decoder.out.weight", "class_head.weight")
                     if k in sd), None)
     if out_key is None:
         raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有可识别的输出层"
                          f"（out.weight / model.output.weight / "
                          f"decode_head.linear_pred.weight / "
-                         f"model.segmentation_head.0.weight / decoder.out.weight），"
+                         f"model.segmentation_head.0.weight / "
+                         f"decoder.out.weight / class_head.weight），"
                          f"无法判断输出通道数")
     out_ch = int(sd[out_key].shape[0])
     if require is not None and out_ch != require:
@@ -117,13 +119,17 @@ def load_unet(pth, device="cpu", require: int = None):
         # 纯 PyTorch U-Mamba_Bot 2D（9 级残差 U-Net + 最深层 Mamba）
         from common.umamba import UMambaBot2D
         model = UMambaBot2D(in_ch=3, out_ch=out_ch, norm=norm)
+    elif arch == "mask2former":
+        # 自包含的 Mask2Former 简化版（ResNet + FPN + query mask 解码器）
+        from common.mask2former import Mask2Former2D
+        model = Mask2Former2D(in_ch=3, out_ch=out_ch, norm=norm)
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
                          f"（只支持 unet / unet++ / attention_unet / swin_unet / "
                          f"segformer / transunet / sam / sam2 / sam3 / medsam / "
-                         f"umamba）")
+                         f"umamba / mask2former）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {
