@@ -65,6 +65,9 @@ def parse_args():
     p.add_argument("--exclude-val", action="store_true",
                    help="排除 config.VAL_PLANTS 的验证植株（与训练脚本同口径）")
     p.add_argument("--no-test", action="store_true", help="不导出 imagesTs")
+    p.add_argument("--test-only", action="store_true",
+                   help="只导出 imagesTs 并更新 case_map.json 的 test 部分，"
+                        "不改 imagesTr/labelsTr（训练集已经导出过时用）")
     p.add_argument("--limit", type=int, default=0,
                    help="只导出前 N 组训练样本（调试用；0=全部）")
     return p.parse_args()
@@ -162,8 +165,44 @@ def export_channel(args, ds_id, ch_name, ch_idx, train_pairs, test_pairs,
           f" | 测试图 {n_test} 张")
 
 
+def export_test_only(args):
+    """只刷新 imagesTs 和 case_map.json 的 test 部分，不动训练集。"""
+    tp = sorted(discover_pairs(args.test_src))
+    if args.limit:
+        tp = tp[:args.limit]
+    if not tp:
+        sys.exit(f"[错误] {args.test_src} 里没有测试图片，无法导出 imagesTs")
+    test_map = _case_names([n for n, _, _ in tp])
+    path_by_name = {name: img_path for name, img_path, _ in tp}
+
+    for i, (_ch_name, _ch_idx, label) in enumerate(CHANNELS):
+        ds_dir = args.out / f"Dataset{args.base_id + i:03d}_{label}"
+        if not ds_dir.is_dir():
+            sys.exit(f"[错误] 找不到 {ds_dir}；请先完整导出一次训练集")
+        images_ts = ds_dir / "imagesTs"
+        images_ts.mkdir(parents=True, exist_ok=True)
+        # 清掉旧的测试图，避免测试集变化后残留
+        for old in images_ts.glob("*.png"):
+            old.unlink()
+        for case, name in test_map.items():
+            _save_image(image_io.load_rgb(path_by_name[name]),
+                        images_ts / f"{case}_0000.png")
+
+        cm_path = ds_dir / "case_map.json"
+        cm = (json.loads(cm_path.read_text(encoding="utf-8"))
+              if cm_path.is_file() else {"train": {}, "test": {}})
+        cm["test"] = test_map
+        cm_path.write_text(json.dumps(cm, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+        print(f"[{ds_dir.name}] 测试图 {len(test_map)} 张 -> {images_ts}")
+
+
 def main():
     args = parse_args()
+    if args.test_only:
+        export_test_only(args)
+        print("完成：imagesTs 与 case_map.test 已更新")
+        return
     pairs = discover_pairs(args.src)
     if not pairs:
         sys.exit(f"[错误] {args.src} 里没有样本")

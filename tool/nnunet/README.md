@@ -35,6 +35,8 @@ python tool/nnunet/export_dataset.py \
 
 - `--gt-only`：去掉 scr，只保留 GT；
 - `--exclude-val`：排除 `config.VAL_PLANTS` 对应的验证植株（与训练脚本同口径）；
+- `--test-only`：只重新导出 `imagesTs` 并更新 `case_map.json` 的 `test` 部分，
+  不动 `imagesTr/labelsTr`（训练集已经导出、只是漏了测试图时用）；
 - `--limit N`：只导出前 N 组，调试用。
 
 输出里每个数据集都有 `case_map.json`（case 名 ↔ 原始文件名），评测时要用。

@@ -221,8 +221,14 @@ def parse_args():
                    help="联合 Dice 连续 N 轮无提升则早停（应 > --lr-patience）")
     p.add_argument("--lr-patience", type=int, default=config.LR_PATIENCE,
                    help="联合 Dice 连续 N 轮无提升则 LR 减半（默认见 config.LR_PATIENCE）")
-    p.add_argument("--val-size", type=int, default=config.VAL_SIZE,
-                   help="验证集植株数（同植株的全部时点整组进同一侧）")
+    p.add_argument("--val-size", type=int, default=None,
+                   help="验证集数量：plant 模式是**植株数**（默认 config.VAL_SIZE）；"
+                        "image 模式是**样本数**。都不指定时 image 用 --val-frac 自动算")
+    p.add_argument("--val-frac", type=float, default=0.2,
+                   help="image 模式下验证集比例（--val-size 未指定时生效，默认 0.2）")
+    p.add_argument("--split-mode", default="image", choices=("plant", "image"),
+                   help="train/val 划分方式：image=按单图随机（默认，忽略 VAL_PLANTS，"
+                        "同一植株可能同时出现在 train/val）；plant=按植株整组")
     p.add_argument("--seed", type=int, default=config.SEED)
     p.add_argument("--pos-weight", default=None,
                    help="逐通道 BCE 正样本权重，逗号分隔、顺序同 CLASS_NAMES"
@@ -348,13 +354,14 @@ def parse_args():
     return p.parse_args()
 
 
-def split_by_plant(names, val_size, seed):
-    """按植株分组划分：返回 (训练名列表, 验证名列表, 验证植株列表)。
+def split_by_plant(names, val_size, seed, mode="image", val_frac=0.2):
+    """划分 train/val：返回 (训练名列表, 验证名列表, 验证植株列表)。
 
-    同一植株的所有时点整组进同一侧，避免「同株不同时点」跨训练/验证造成泄漏。
-    val_size = 验证集植株数；config.VAL_PLANTS 非空时优先按它钉死 ——
-    **但换数据集（如新标的一批）时一个都钉不上，这时退回随机划分**：否则验证集是空的，
-    训练会「不早停、保存最后轮」，等于没有验证（2026-10-06 在「多变形标注」数据集上踩到）。
+    mode="image"（默认）：按**单图**随机，验证集由 `--seed` 决定，大小
+    `val_size`（样本数）或 `val_frac`（比例，默认 0.2）。同一植株的不同时点
+    可能同时出现在 train/val 两侧；**忽略 config.VAL_PLANTS**。
+    mode="plant"：按植株整组划分，避免同株泄漏；`val_size` 是植株数，
+    config.VAL_PLANTS 非空时优先按它钉死，一个都钉不上时退回随机植株划分。
     """
     def _random_val(ks):
         rng = np.random.RandomState(seed)
@@ -362,6 +369,24 @@ def split_by_plant(names, val_size, seed):
         n = min(max(val_size, 0), max(len(ks) - 1, 0))   # **至少给训练留 1 株**
         return sorted(ks[:n])
 
+    if mode == "image":
+        arr = sorted(names)
+        rng = random.Random(seed)
+        rng.shuffle(arr)
+        if val_size is None:
+            n = max(1, int(round(len(arr) * val_frac)))
+        else:
+            n = int(val_size)
+        n = min(max(n, 0), max(len(arr) - 1, 0))
+        val_names = sorted(arr[:n])
+        train_names = sorted(arr[n:])
+        val_plants = sorted({plant_key(n) for n in val_names})
+        print(f"[划分] image 模式：按单图随机（seed={seed}），验证 "
+              f"{len(val_names)} 组（{len(val_plants)} 植株，同株可能跨侧）")
+        return train_names, val_names, val_plants
+
+    if val_size is None:
+        val_size = config.VAL_SIZE
     groups = {}
     for n in names:
         groups.setdefault(plant_key(n), []).append(n)
@@ -455,8 +480,9 @@ def main():
 
     # ---- 数据划分：按植株整组进出（保证可复现） ----
     names = [n for n, _, _ in _pairs(args.data_dir)]
-    train_names, val_names, val_plants = split_by_plant(names, args.val_size,
-                                                        args.seed)
+    train_names, val_names, val_plants = split_by_plant(
+        names, args.val_size, args.seed, mode=args.split_mode,
+        val_frac=args.val_frac)
     train_plants = sorted({plant_key(n) for n in train_names})
     print(f"数据: 共 {len(names)} 组 / {len(set(map(plant_key, names)))} 植株 | "
           f"训练 {len(train_names)} 组({len(train_plants)} 植株) | "

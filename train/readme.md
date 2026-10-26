@@ -14,13 +14,15 @@
 
 ### 1.1 数据与真值
 
-- 默认训练目录：`datasets/root/train`（`GT/` 人工掩码 + `scr/` 伪标签）。
+- 默认训练目录：`datasets/root/train`（当前新划分只有 `GT/` 人工掩码，没有 `scr/`）。
 - **GT 的 root 默认用 `masks/<名>.png` 像素掩码**；json 多边形只在该图没有掩码时兜底。
   日志会打印 `[真值口径] root 使用像素掩码 masks/*.png: GT: 21/21 | scr: 0/50`。
   `--no-gt-mask` 只用于「掩码 vs 多边形」的 A/B 对照，平时不要加。
-- `scr` 是折线伪标签，用 `--src-weight 0.3` 给它的损失打折（GT 恒为 1.0）。
-- 验证集按**植株**整组切分（`config.VAL_PLANTS` 钉死 4 株），与训练集同株的时点不会
-  落在验证集里；测试集见 `datasets/root/test/GT`。
+- 若数据集含 `scr/`（折线伪标签），用 `--src-weight 0.3` 给它的损失打折（GT 恒为 1.0）。
+- **验证集默认按单图随机**（`--split-mode image`，由 `--seed` 决定，默认 42；
+  `--val-frac 0.2` 决定比例）。同一植株的时点可能同时出现在 train/val。
+  需要按植株整组时显式用 `--split-mode plant`，此时才启用 `config.VAL_PLANTS`。
+  测试集见 `datasets/root/test/GT`。
 
 ### 1.2 输入尺寸
 
@@ -406,7 +408,9 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `--bce-weight 1,1,0.3` | 覆盖逐通道 BCE 权重（默认见 config，格式同上） |
 | `--dice-weight 1,1,1` | 覆盖逐通道 Dice 权重；check 默认 0，冻结骨干模型可加 1 防止塌成全 1 |
 | `--no-gt-mask` | 忽略 GT 像素掩码、改用 json 多边形；**只用于 A/B 对照** |
-| `--val-size N` | 验证集植株数（默认 config.VAL_SIZE；当前由 VAL_PLANTS 钉死） |
+| `--val-size N` | 验证集数量：image 模式是**样本数**；plant 模式是**植株数**（默认 config.VAL_SIZE） |
+| `--val-frac 0.2` | image 模式下验证集比例（默认 0.2；`--val-size` 未指定时生效） |
+| `--split-mode image` | train/val 划分方式：默认**单图随机**（忽略 VAL_PLANTS，同株可能跨侧）；`plant` 才按植株整组 |
 | `--patience` / `--lr-patience` | 早停 / 降 LR 的耐心轮数 |
 | `--gpu N` | 单进程指定卡；DDP 用 `CUDA_VISIBLE_DEVICES` |
 | `--out-dir` | 模型输出根目录（默认 `model/`） |
