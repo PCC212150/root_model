@@ -339,6 +339,9 @@ def parse_args():
     p.add_argument("--medsam-finetune-encoder", action="store_true",
                    help="解冻 MedSAM ViT-B 编码器一起训练（默认冻结；约 90M 参数，"
                         "71 张图从零微调容易过拟合）")
+    p.add_argument("--unetpp-checkpoint", action="store_true",
+                   help="UNet++ 嵌套节点启用梯度检查点：1536/batch1 显存不够时用"
+                        "（用时间换显存，约慢 20~30%%；只对 --arch unet++ 生效）")
     p.add_argument("--swin-pretrained", default=str(config.SWIN_PRETRAINED_CKPT),
                    help="Swin-Unet 编码器的 ImageNet 预训练权重路径（默认见 "
                         "config.SWIN_PRETRAINED_CKPT）；none = 从零训练。"
@@ -583,7 +586,8 @@ def main():
               f"与推理用的滑动平均对不上，会出现严重欠分割。请用 batch≥2 或把 "
               f"config.NORM 改成 'group'。")
     if args.arch == "unet++":
-        model = UNetPlusPlus(in_ch=3, out_ch=model_out_ch, norm=args.norm)
+        model = UNetPlusPlus(in_ch=3, out_ch=model_out_ch, norm=args.norm,
+                             use_checkpoint=args.unetpp_checkpoint)
     elif args.arch == "attention_unet":
         model = AttentionUNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     elif args.arch == "swin_unet":

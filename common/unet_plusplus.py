@@ -21,8 +21,21 @@ Segmentation", DLMIA 2018 / IEEE TMI 2019。
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from common.unet import DoubleConv, Down, make_norm
+
+
+def _checkpointed(module, x):
+    """梯度检查点：前向不保存中间激活，反向时重算。
+
+    use_reentrant=False 对嵌套调用/非张量输出更稳；老版本 torch 没有这个参数时
+    退回默认行为（输入张量 requires_grad，满足 reentrant 的要求）。
+    """
+    try:
+        return checkpoint(module, x, use_reentrant=False)
+    except TypeError:
+        return checkpoint(module, x)
 
 
 class UNetPlusPlus(nn.Module):
@@ -32,8 +45,10 @@ class UNetPlusPlus(nn.Module):
     """
 
     def __init__(self, in_ch: int = 3, out_ch: int = 3, base: int = 64,
-                 norm: str = "batch"):
+                 norm: str = "batch", use_checkpoint: bool = False):
         super().__init__()
+        # 只影响训练时的显存/速度，不改变 state_dict；--unetpp-checkpoint 打开
+        self.use_checkpoint = bool(use_checkpoint)
         features = [base, base * 2, base * 4, base * 8, base * 16]
         self.features = features
 
@@ -70,6 +85,11 @@ class UNetPlusPlus(nn.Module):
                                    size=nodes[(i, 0)].shape[-2:],
                                    mode="bilinear", align_corners=False)
                 parts = [nodes[(i, k)] for k in range(j)] + [up]
-                nodes[(i, j)] = self.nodes[f"{i}_{j}"](torch.cat(parts, dim=1))
+                node_in = torch.cat(parts, dim=1)
+                if self.use_checkpoint and self.training:
+                    nodes[(i, j)] = _checkpointed(
+                        self.nodes[f"{i}_{j}"], node_in)
+                else:
+                    nodes[(i, j)] = self.nodes[f"{i}_{j}"](node_in)
 
         return self.out(nodes[(0, 4)])

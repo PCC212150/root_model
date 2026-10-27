@@ -160,6 +160,11 @@ torchrun --nproc_per_node=3 train/train.py \
 - 全卷积，支持 `--crop`；参数量 **36.62M**；无预训练。
 - **显存显著高于 U-Net**：全分辨率节点多，2048/batch1 实测约 24GB 会 OOM，
   1792 在 24GB 上卡住；3×3090（0 号卡另有占用）**从 1536 起步**。
+- **1536 在单张 24GB 卡上可能差几百 MB**（实测峰值 23.17GiB，卡可用 23.56GiB）。
+  加 `--unetpp-checkpoint` 对嵌套节点做梯度检查点：512×768 实测峰值
+  6.85GB → 4.99GB（约 -27%），1536 预计 ~17GB，能稳定跑；代价是慢 20~30%。
+  只影响训练显存，不改变 state_dict，旧权重照常加载。
+- 梯度检查点建议配 `--norm group`；`--norm batch` 下重算会重复更新 BN 统计量。
 - 其它超参与 U-Net 相同，只换骨架。
 
 ### 2.3 `--arch attention_unet`（注意力门控）
@@ -411,6 +416,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `--val-size N` | 验证集数量：image 模式是**样本数**；plant 模式是**植株数**（默认 config.VAL_SIZE） |
 | `--val-frac 0.2` | image 模式下验证集比例（默认 0.2；`--val-size` 未指定时生效） |
 | `--split-mode image` | train/val 划分方式：默认**单图随机**（忽略 VAL_PLANTS，同株可能跨侧）；`plant` 才按植株整组 |
+| `--unetpp-checkpoint` | UNet++ 嵌套节点梯度检查点；1536 显存不够时用，慢 20~30%，配 `--norm group` |
 | `--patience` / `--lr-patience` | 早停 / 降 LR 的耐心轮数 |
 | `--gpu N` | 单进程指定卡；DDP 用 `CUDA_VISIBLE_DEVICES` |
 | `--out-dir` | 模型输出根目录（默认 `model/`） |
