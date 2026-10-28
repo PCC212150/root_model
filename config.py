@@ -47,6 +47,9 @@ SAM_PRETRAINED_URL = ("https://dl.fbaipublicfiles.com/segment_anything/"
 # 下面是 medsam_vit_b.pth 的直链；和 SAM 一样只用图像编码器 + 监督解码头。
 # 官方目录: https://drive.google.com/drive/folders/1ETWmi4AiniJeWOt6HAsYgTjYv_fkgzoN
 MEDSAM_PRETRAINED_CKPT = PRETRAINED_DIR / "medsam_vit_b.pth"
+# RPT 的 ESegFormer-B2（Paddle model.pdparams 转出的 PyTorch 版本）：
+# python tool/convert_esegformer_paddle.py --src Net/RPT/model.pdparams
+ESEGFORMER_PRETRAINED_CKPT = PRETRAINED_DIR / "esegformer_b2_from_rpt.pth"
 MEDSAM_PRETRAINED_URL = ("https://drive.usercontent.google.com/download?"
                          "id=1UAmWL88roYR7wKlnApw5Bcuzf2iQgk6_&export=download&confirm=t")
 

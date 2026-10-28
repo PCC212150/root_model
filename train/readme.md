@@ -69,9 +69,12 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,2,3 torchrun --nproc_per_node=3 train/
 
 - U-Net / UNet++ / Attention U-Net：torch 即可。
 - Swin-Unet：`pip install timm einops`；SegFormer：`timm`（装过 Swin 的 einops 就不用了）。
-- TransUNet / SAM / SAM2 / SAM3 / MedSAM / U-Mamba / Mask2Former：**不需要额外装包**
-  ——实现已 vendored 到 `common/`（U-Mamba 的 Mamba、Mask2Former 的 deformable
-  attention 都是纯 PyTorch 实现，不依赖 `mamba_ssm` / detectron2）。
+- TransUNet / SAM / SAM2 / SAM3 / MedSAM / U-Mamba / Mask2Former / VM-UNet /
+  ESegFormer：**训练不需要额外装包** ——实现已 vendored 到 `common/`
+  （U-Mamba 的 Mamba、Mask2Former 的 deformable attention、VM-UNet 的 SS2D
+  selective scan 都是纯 PyTorch 实现，不依赖 `mamba_ssm` / `causal_conv1d` /
+  detectron2）。ESegFormer 复用 SegFormer 的 timm 依赖；只有把 RPT 的
+  `model.pdparams` 转成 PyTorch 时才需要一次 paddlepaddle。
   注意 SAM 2/3 官方包要求 Python≥3.10，本项目的 vendored 版本在 Python 3.9 上也能跑。
 
 ### 1.6 单通道任务（默认）与 `--task all`
@@ -136,7 +139,7 @@ python inference.py --model model_202610241829 --dir <图片文件夹> --size 15
 ## 2. 各网络操作细则
 
 > ⚠️ 下面的命令默认 `--task root`（单通道 root 模型）。要跑三通道联合模型，
-> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.13。
+> 在命令里加 `--task all`；单通道的 stem/check 见 1.6 与 2.15。
 
 ### 2.1 `--arch unet`（经典 U-Net，baseline）
 
@@ -352,7 +355,88 @@ torchrun --nproc_per_node=3 train/train.py \
 - 从零训练，不加载 COCO/ADE 预训练权重。
 - 小尺寸 256 下 20 轮验证 Dice 约 0.19，属于正常起步；最终效果看 1536/2000 轮。
 
-### 2.13 单通道 stem / check_background
+### 2.13 `--arch esegformer`（RPT 的 ESegFormer-B2）
+
+```bash
+# 从零训练（与其它当前协议模型一致）
+python train/train.py --arch esegformer --task all --size 1536 --batch 1 --accum 12 \
+  --workers 8 --norm group --epochs 2000 --val-frac 0.15
+
+# 用 RPT 预训练权重微调（推荐；.pth 需先在有 paddle 的机器上转换一次）
+python tool/convert_esegformer_paddle.py --src Net/RPT/model.pdparams \
+  --out pretrained_ckpt/esegformer_b2_from_rpt.pth
+python train/train.py --arch esegformer --task all --size 1536 --batch 1 --accum 12 \
+  --workers 8 --norm group --epochs 2000 --val-frac 0.15 \
+  --esegformer-pretrained pretrained_ckpt/esegformer_b2_from_rpt.pth
+```
+
+- 结构：MiT-B2 骨干 + **spatial_attn** 分支（3→32→64→128→256 四层 3x3 卷积 +
+  CBAM，输出 1/4 分辨率、256 通道的 c5）+ **5 级解码头**（c5 + c1..c4，全部投影到
+  `embedding_dim=768`，拼接 5×768 后融合）。总参数 **28.53M**。
+- 与标准 `--arch segformer` 的区别就是上面两处；骨干的 MiT 块、sr_ratio 注意力、
+  Mix-FFN、LayerNorm 与 SegFormer 完全一致。代码在
+  [common/esegformer.py](../common/esegformer.py)，复用
+  [common/segformer.py](../common/segformer.py) 的 MiT 组件。
+- **训练不需要 paddle**；只有把 RPT 的 `model.pdparams` 转成 PyTorch 时需要一次
+  `paddlepaddle`（本机 `pcc` 环境有 3.3.0）。转换脚本会处理 Paddle Linear 的
+  `[in,out]` 转置、BatchNorm 的 `_mean/_variance`、`linear_fuse._conv` 等键名。
+  已验证转换后的 PyTorch 输出与原 Paddle 模型一致：同输入最大绝对误差 **3.2e-5**
+  （相对 9.7e-7）。
+- 预训练是 **2 类 root/background**；训练 3 通道时会自动跳过
+  `decode_head.linear_pred.*`（形状不符），骨干 351/351 个张量全部加载。
+- **零样本效果很弱，不要直接当 baseline**：把 RPT 权重直接套到我们 10 张测试图上，
+  整图缩放（512/768/1024/1536）root Dice 只有 0.03~0.12；按 RPT 的原生分辨率滑窗
+  （crop 1024/stride 768）在单张 `root_C019-4_20250102CK` 上是 0.42（阈值 0.5），
+  加 flip TTA + 阈值 0.2 到 0.56，仍远低于微调后的 U-Net/TransUNet。预训练权重更适合
+  作为**初始化**，不是直接推理。
+- 微调建议：先全参数微调（上面的命令）；想复现 RPT 的
+  `freeze_exceptEAM`（冻结骨干、只训 spatial_attn + 解码头）就加
+  `--esegformer-freeze-backbone`（只有配合 `--esegformer-pretrained` 才有意义）。
+- 用 `--norm group`（项目默认）时，预训练里的 BatchNorm running stats 会被跳过，
+  只加载 weight/bias；骨干/卷积权重仍然加载。要完全复现 RPT 的 BN 需要 batch≥2，
+  本项目 batch1 不建议。
+- 输入归一化：默认 `--esegformer-input-norm pm1`，在模型内部做 `x*2-1`，匹配 RPT 的
+  `Normalize(mean=0.5,std=0.5)`；数据管线仍然输出 [0,1]。不要和 `none` 混用。
+- 显存/速度（本机 RTX 5060 8GB，batch1，AMP）：768×1152 约 **6.2GB / 0.31s/iter**；
+  1024×1536 约 **13.3GB / 8.2s/iter**（8GB 卡发生共享内存回退，3090 24GB 可放下）。
+  1536 下如果与其他进程共享显存，先用 `--size 768` 或 `--crop`。
+- 全卷积、支持 `--crop`；输入 H/W 建议是 32 的倍数；输出层是
+  `decode_head.linear_pred.weight`，`ckpt.py` 已注册，测试/推理无需再给 `--arch`。
+
+### 2.14 `--arch vmunet`（VM-UNet-T）
+
+```bash
+# 整图缩放（与其它模型同为 resize 管线；768 是 SS2D 在 24GB 上比较现实的上限）
+python train/train.py --arch vmunet --task all --size 768 --batch 1 --accum 12 \
+  --workers 8 --epochs 2000 --norm group
+
+# 或者按 VM-UNet 原生的 patch 训练方式：原始分辨率切片 512，推理滑窗
+python train/train.py --arch vmunet --task all --crop 512 --batch 2 --accum 6 \
+  --workers 8 --epochs 2000 --norm group
+```
+
+- 官方 VM-UNet（Ruan et al., 2024）的 **VM-UNet-T** 结构：patch 4、4 级 VSS
+  编解码器、dims 96/192/384/768、编码器 depths 2/2/2/2、解码器 2/2/2/1，
+  drop_path 0.2；与官方 `config_setting.py` 的训练配置一致（注意不是
+  `vmunet.py` 类签名的 2/2/9/2 默认值）。
+- **不需要 `mamba_ssm` / CUDA 扩展**：[common/vmunet.py](../common/vmunet.py) 把
+  官方 SS2D 的四方向 selective scan 改成纯 PyTorch 分块扫描：块内两遍
+  `chunk` 步循环 + `nc` 步块间转移，数学上与官方 `selective_scan_ref` 等价
+  （本地随机张量对齐，输出/梯度误差 <1e-6）。
+- 归一化固定为 LayerNorm（官方结构），不跟随 `--norm`；输入 H/W 内部 pad 到 32
+  的倍数，输出裁回。全卷积、支持 `--crop`。
+- 总参数 **27.43M**；默认对每个 VSS block 开梯度检查点（`--vmunet-no-checkpoint`
+  可关）。
+- **性能注意**：SS2D 的 Python 级扫描比 CNN 慢得多。本机 RTX 5060 8GB 实测
+  384×512 约 **9.7s/iter**（峰值 4.1GB）；576×768 峰值 8.9GB 已超 8GB，发生
+  共享内存回退后约 81s/iter，不能代表 3090。3090 上 768 预计仍在数小时到十几
+  小时量级，**1536 不建议**（预计 1 天以上）。先用 `--size 768` 或 `--crop 512`
+  跑一版，确认收敛后再决定是否加分辨率。
+- 可调：`--vmunet-chunk`（默认 0=按序列长度自动选 16~256；显存紧可固定 64）、
+  `--vmunet-d-state`（默认 16，调小明显省显存但权重与官方不兼容）、
+  `--vmunet-drop-path`（默认 0.2）。
+
+### 2.15 单通道 stem / check_background
 
 ```bash
 # stem（所有骨架都支持，把 --arch 换成需要的即可）
@@ -368,7 +452,7 @@ python train/train.py --arch unet --task check_background --size 1536 --batch 1 
 - 单通道模型用 `test/test_task.py` 评测，见 1.6。
 - check_background 单独训练时默认 Dice=1（否则模型会塌成全 1）。
 
-### 2.14 nnU-Net（外部框架，不是 `--arch`）
+### 2.16 nnU-Net（外部框架，不是 `--arch`）
 
 nnU-Net 是完整框架（自己的 dataset 格式、plan/preprocess、5 折训练、预测），
 不能塞进 `--arch`。按 [tool/nnunet/README.md](../tool/nnunet/README.md) 走：
@@ -390,6 +474,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `attention_unet` | ✓ | H/W %16 | ✓ | 无 | 31.74M / 31.74M | 与 U-Net 接近 |
 | `swin_unet` | ✗ | H/W %32 | ✗ | ImageNet Swin-T | 41.38M / 41.38M | 8.3GB |
 | `segformer` | ✓ | 建议 %16 | ✓ | 无（可指定 mmseg） | b2 24.72M / 24.72M | 8.5GB |
+| `esegformer` | ✓ | 建议 %32 | ✓ | 无（可加载 RPT B2） | b2 28.53M / 28.53M | 1024×1536 约13.3GB（8GB 卡回退） |
 | `transunet` | ✗ | H/W %16 | ✗ | ImageNet-21k R50+ViT | 109.84M / 109.84M | 10.9GB |
 | `sam` | ✓ | 建议 %16 | ✓ | SA-1B ViT-B | 90.24M / **0.57M** | 5.6GB |
 | `sam2` | ✓ | 建议 %16 | ✓ | SAM 2.1 Hiera-T | 28.23M / **1.01M** | 1.4GB |
@@ -397,6 +482,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `medsam` | ✓ | 建议 %16 | ✓ | MedSAM ViT-B | 90.24M / **0.57M** | ~5.6GB |
 | `umamba` | ✓ | 内部 pad 到 %256 | ✓ | 无 | 88.55M / 88.55M | ~8.5GB |
 | `mask2former` | ✓ | 内部 pad 到 %32 | ✓ | 无 | 19.52M / 19.52M | ~3.3GB |
+| `vmunet` | ✓ | 内部 pad 到 %32 | ✓ | 无 | 27.43M / 27.43M | 384×512 约4.1GB；1536 未测（8GB 上 576×768 已 8.9GB） |
 
 \* 本机 RTX 5060（8GB，batch1，前向+反向）。8GB 卡上的数字超过 8GB 时会发生共享内存
 回退、速度变慢但未必 OOM；3090（24GB）上实际更快、更宽裕。UNet++ 是唯一需要在

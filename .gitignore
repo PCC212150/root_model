@@ -4,6 +4,8 @@
 *.pth
 *.npz
 *.pt
+# ESegFormer 转换脚本的中间产物（paddle -> numpy pickle）
+/pretrained_ckpt/*.pkl
 # ===== 下面这些都是「项目根目录下」的产物文件夹 =====
 # **前导斜杠不能省**：gitignore 里写 `analysis_datas/` 会匹配**任意层级**的同名目录，
 # 于是 `tool/analysis_datas/`（工具代码！）也被一起忽略、提交不进去 —— 2026-09-16 实际踩到过。
@@ -12,6 +14,7 @@
 /datasets/
 /model/
 /inference_pictures/
+/inference_pictures-2/
 /result/
 
 # ===== 实验报告 =====

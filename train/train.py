@@ -199,7 +199,7 @@ def parse_args():
                         "**不缩放**随机裁 --crop × --crop 训练，让模型看到原始分辨率的"
                         "根宽（5472x3648 的图缩到 1024 时，原图 10px 的根只剩 1.9px）。"
                         "此时 --size 只写进权重、不参与预处理。"
-                        "⚠️ 推理时**必须显式给 --size**：模型是全卷积的，越接近原始分辨率"
+                        "注意：推理时**必须显式给 --size**：模型是全卷积的，越接近原始分辨率"
                         "越好，24G 上 --size 3648 约 18GB。默认见 config.CROP_SIZE")
     p.add_argument("--crop-repeat", type=int, default=config.CROP_REPEAT,
                    help="切片模式下每张原图在一个 epoch 里抽多少个块（默认见 "
@@ -260,7 +260,8 @@ def parse_args():
     p.add_argument("--arch", default="unet",
                    choices=("unet", "unet++", "attention_unet", "swin_unet",
                             "segformer", "transunet", "sam", "sam2", "sam3",
-                            "medsam", "umamba", "mask2former"),
+                            "medsam", "umamba", "mask2former", "vmunet",
+                            "esegformer"),
                    help="骨架：unet=经典 U-Net（默认，历史 baseline）；"
                         "unet++=嵌套跳跃连接（common/unet_plusplus.py）；"
                         "attention_unet=注意力门控跳连（common/attention_unet.py）；"
@@ -288,8 +289,16 @@ def parse_args():
                         "pad 到 256 的倍数）；"
                         "mask2former=Mask2Former 简化版（common/mask2former.py，"
                         "ResNet 骨干 + FPN + query-based mask 解码器；纯 PyTorch "
-                        "deformable attention，不需要 detectron2；内部 pad 到 32 的倍数）。"
-                        "⚠️ UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
+                        "deformable attention，不需要 detectron2；内部 pad 到 32 的倍数）；"
+                        "vmunet=VM-UNet-T（common/vmunet.py，VSS 四方向 selective "
+                        "scan，纯 PyTorch 分块实现，不需要 mamba_ssm/CUDA 扩展；"
+                        "全卷积，内部 pad 到 32 的倍数。注意：SS2D 在 1536 下很慢，"
+                        "建议先看 --vmunet-chunk 和训练尺寸说明）；"
+                        "esegformer=ESegFormer（RPT 的 root 分割骨架，"
+                        "common/esegformer.py；MiT + spatial_attn/CBAM + 5 级解码头，"
+                        "默认 b2；--esegformer-pretrained 可加载 RPT 的 model.pdparams "
+                        "转出的 PyTorch 权重；不需要 paddle）。"
+                        "注意：UNet++ 显存高得多：2048/batch1 实测约 24GB 会 OOM，"
                         "3×3090（GPU0 另有 4GB 占用）建议从 ≤1536 起步；"
                         "Attention U-Net 的显存与 U-Net 接近")
     p.add_argument("--segformer-variant", default="b2",
@@ -299,6 +308,24 @@ def parse_args():
     p.add_argument("--segformer-pretrained", default="none",
                    help="SegFormer 官方 mmseg 预训练权重的路径；none=从零训练（默认）。"
                         "支持 backbone.* / 裸 MiT 键名；只对 --arch segformer 生效")
+    p.add_argument("--esegformer-variant", default="b2",
+                   choices=("b0", "b1", "b2", "b3", "b4", "b5"),
+                   help="ESegFormer 变体（默认 b2，RPT 发布的权重是 B2）")
+    p.add_argument("--esegformer-pretrained", default="none",
+                   help="RPT ESegFormer-PyTorch 权重路径（由 "
+                        "tool/convert_esegformer_paddle.py 从 model.pdparams 转出）；"
+                        "none=从零训练（默认）。相对路径按项目根目录解析")
+    p.add_argument("--esegformer-freeze-backbone", action="store_true",
+                   help="复现 RPT 的 freeze_exceptEAM：冻结骨干，只训 spatial_attn "
+                        "和解码头。只有配合 --esegformer-pretrained 才有意义")
+    p.add_argument("--esegformer-input-norm", default="pm1",
+                   choices=("pm1", "none"),
+                   help="模型内部输入归一化：pm1=x*2-1（默认，匹配 RPT 的 "
+                        "Normalize(0.5,0.5)）；none=直接用数据管线的 [0,1]")
+    p.add_argument("--esegformer-dropout", type=float, default=0.1,
+                   help="ESegFormer 解码头 Dropout2d（默认 0.1，与 RPT 一致）")
+    p.add_argument("--esegformer-drop-path", type=float, default=0.1,
+                   help="ESegFormer 骨干 stochastic depth（默认 0.1，与 RPT 一致）")
     p.add_argument("--transunet-pretrained",
                    default=str(config.TRANSUNET_PRETRAINED_CKPT),
                    help="TransUNet 的 R50+ViT-B_16.npz 预训练权重路径（默认见 "
@@ -339,6 +366,19 @@ def parse_args():
     p.add_argument("--medsam-finetune-encoder", action="store_true",
                    help="解冻 MedSAM ViT-B 编码器一起训练（默认冻结；约 90M 参数，"
                         "71 张图从零微调容易过拟合）")
+    p.add_argument("--vmunet-chunk", type=int, default=0,
+                   help="VM-UNet selective scan 的块长。0=按序列长度自动"
+                        "（16~256，默认）；固定值可手动调。每块内做两遍 chunk 步"
+                        "循环 + nc 步块间转移。只对 --arch vmunet 生效")
+    p.add_argument("--vmunet-d-state", type=int, default=16,
+                   help="VM-UNet SS2D 的状态维度 N（默认 16，与官方一致）；"
+                        "调小可明显降低显存和扫描开销，但权重与官方不兼容")
+    p.add_argument("--vmunet-drop-path", type=float, default=0.2,
+                   help="VM-UNet VSS block 的 stochastic depth 概率（官方默认 0.2）")
+    p.add_argument("--vmunet-no-checkpoint", action="store_true",
+                   help="关闭 VM-UNet 每个 VSS block 的梯度检查点。默认开启："
+                        "1536 下不检查点会保存整条 selective-scan 的中间状态，"
+                        "24GB 也会 OOM")
     p.add_argument("--unetpp-checkpoint", action="store_true",
                    help="UNet++ 嵌套节点启用梯度检查点：1536/batch1 显存不够时用"
                         "（用时间换显存，约慢 20~30%%；只对 --arch unet++ 生效）")
@@ -621,6 +661,34 @@ def main():
         elif not ddp.enabled or ddp.is_main:
             print(f"[SegFormer] variant={args.segformer_variant}，从零训练"
                   f"（--segformer-pretrained 可指定官方权重）")
+    elif args.arch == "esegformer":
+        # RPT 的 ESegFormer：MiT + spatial_attn(CBAM) + 5 级解码头。
+        # 不依赖 paddle；预训练权重需先用 tool/convert_esegformer_paddle.py 转换。
+        from common.esegformer import ESegFormer2D, load_pretrained_esegformer
+        model = ESegFormer2D(
+            in_ch=3, out_ch=model_out_ch,
+            variant=args.esegformer_variant, norm=args.norm,
+            dropout=args.esegformer_dropout,
+            drop_path_rate=args.esegformer_drop_path,
+            input_norm=args.esegformer_input_norm,
+            freeze_backbone=args.esegformer_freeze_backbone)
+        if args.esegformer_pretrained.lower() != "none":
+            ckpt_path = Path(args.esegformer_pretrained)
+            if not ckpt_path.is_absolute():
+                ckpt_path = config.PROJECT_ROOT / ckpt_path
+            load_pretrained_esegformer(
+                model, ckpt_path,
+                verbose=(not ddp.enabled or ddp.is_main))
+            if args.esegformer_freeze_backbone and (
+                    not ddp.enabled or ddp.is_main):
+                print("[ESegFormer] 已冻结骨干和 linear_c1..c4，只训练 "
+                      "spatial_attn + linear_c5 + fuse + pred"
+                      "（RPT 的 freeze_exceptEAM 策略）")
+        elif args.esegformer_freeze_backbone and (
+                not ddp.enabled or ddp.is_main):
+            print("[ESegFormer] 警告：没有预训练权重却要求冻结骨干，"
+                  "spatial_attn 之外的骨干是随机初始化；建议去掉 "
+                  "--esegformer-freeze-backbone 或加载预训练")
     elif args.arch == "transunet":
         # 延迟导入：TransUNet 依赖 numpy（已装），不需要额外环境
         from common.transunet import TransUNet2D, load_pretrained_transunet
@@ -701,6 +769,15 @@ def main():
         # 自包含的 Mask2Former 简化版；不需要 detectron2 / CUDA 扩展
         from common.mask2former import Mask2Former2D
         model = Mask2Former2D(in_ch=3, out_ch=model_out_ch, norm=args.norm)
+    elif args.arch == "vmunet":
+        # 纯 PyTorch 的 VM-UNet-T；SS2D 用分块 selective scan，不需要 mamba_ssm。
+        # 结构内部全部是 LayerNorm，不跟随 --norm。
+        from common.vmunet import VMUNet2D
+        model = VMUNet2D(in_ch=3, out_ch=model_out_ch,
+                         d_state=args.vmunet_d_state,
+                         drop_path_rate=args.vmunet_drop_path,
+                         use_checkpoint=not args.vmunet_no_checkpoint,
+                         chunk=args.vmunet_chunk)
     else:
         model = UNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报

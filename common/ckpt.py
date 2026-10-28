@@ -41,14 +41,16 @@ def load_unet(pth, device="cpu", require: int = None):
                                 "model.output.weight",
                                 "decode_head.linear_pred.weight",
                                 "model.segmentation_head.0.weight",
-                                "decoder.out.weight", "class_head.weight")
+                                "decoder.out.weight", "class_head.weight",
+                                "vmunet.final_conv.weight")
                     if k in sd), None)
     if out_key is None:
         raise SystemExit(f"[错误] {pth.name} 的 state_dict 里没有可识别的输出层"
                          f"（out.weight / model.output.weight / "
                          f"decode_head.linear_pred.weight / "
                          f"model.segmentation_head.0.weight / "
-                         f"decoder.out.weight / class_head.weight），"
+                         f"decoder.out.weight / class_head.weight / "
+                         f"vmunet.final_conv.weight），"
                          f"无法判断输出通道数")
     out_ch = int(sd[out_key].shape[0])
     if require is not None and out_ch != require:
@@ -123,13 +125,31 @@ def load_unet(pth, device="cpu", require: int = None):
         # 自包含的 Mask2Former 简化版（ResNet + FPN + query mask 解码器）
         from common.mask2former import Mask2Former2D
         model = Mask2Former2D(in_ch=3, out_ch=out_ch, norm=norm)
+    elif arch == "esegformer":
+        # RPT 的 ESegFormer；5 级解码头，输出层同样是 decode_head.linear_pred
+        from common.esegformer import ESegFormer2D
+        model = ESegFormer2D(
+            in_ch=3, out_ch=out_ch,
+            variant=hp.get("esegformer_variant", "b2"), norm=norm,
+            dropout=hp.get("esegformer_dropout", 0.1),
+            drop_path_rate=0.0,  # eval 下无影响
+            input_norm=hp.get("esegformer_input_norm", "pm1"),
+            freeze_backbone=False)
+    elif arch == "vmunet":
+        # 纯 PyTorch VM-UNet-T；d_state 影响权重形状，必须从 hparams 恢复。
+        # chunk / use_checkpoint 只影响速度和显存，与 state_dict 无关。
+        from common.vmunet import VMUNet2D
+        model = VMUNet2D(in_ch=3, out_ch=out_ch,
+                         d_state=hp.get("vmunet_d_state", 16),
+                         drop_path_rate=0.0, use_checkpoint=False,
+                         chunk=hp.get("vmunet_chunk", 0))
     elif arch == "unet":
         model = UNet(in_ch=3, out_ch=out_ch, norm=norm)
     else:
         raise SystemExit(f"[错误] 权重里记录的骨架 {arch!r} 不认识"
                          f"（只支持 unet / unet++ / attention_unet / swin_unet / "
                          f"segformer / transunet / sam / sam2 / sam3 / medsam / "
-                         f"umamba / mask2former）")
+                         f"umamba / mask2former / vmunet / esegformer）")
     model.load_state_dict(sd)
     model.to(device)
     meta = {
