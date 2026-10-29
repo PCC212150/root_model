@@ -3,9 +3,30 @@
 编码器 4 层(64→128→256→512) + 瓶颈(1024)，解码器对称；每层 DoubleConv。
 输入输出长宽需为 16 的倍数（common.image_io.target_size 保证）；
 因池化取整可能出现的奇偶尺寸错位，拼接前对 skip 特征做中心裁剪对齐。
+
+`use_checkpoint=True`（对应 `--unet-checkpoint`）对编码器 DoubleConv、瓶颈和
+整个解码器 Up 做梯度检查点：前向不保存中间激活，反向重算。不改变 state_dict，
+只影响训练显存/速度；2736 + GroupNorm 在 24GB 卡上 OOM 时使用。
 """
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+
+
+def _checkpointed(module, x):
+    """单输入梯度检查点；use_reentrant=False 对嵌套/非张量场景更稳。"""
+    try:
+        return checkpoint(module, x, use_reentrant=False)
+    except TypeError:
+        return checkpoint(module, x)
+
+
+def _checkpointed2(module, x, y):
+    """双输入梯度检查点（U-Net 的 Up 需要 x 和 skip）。"""
+    try:
+        return checkpoint(module, x, y, use_reentrant=False)
+    except TypeError:
+        return checkpoint(module, x, y)
 
 
 def make_norm(kind: str, ch: int) -> nn.Module:
@@ -76,8 +97,10 @@ class UNet(nn.Module):
     """
 
     def __init__(self, in_ch: int = 3, out_ch: int = 3, base: int = 64,
-                 norm: str = "batch"):
+                 norm: str = "batch", use_checkpoint: bool = False):
         super().__init__()
+        # 只影响训练显存/速度，不改变 state_dict；--unet-checkpoint 打开
+        self.use_checkpoint = bool(use_checkpoint)
         features = [base, base * 2, base * 4, base * 8]  # 64,128,256,512
         self.down1 = Down(in_ch, features[0], norm=norm)
         self.down2 = Down(features[0], features[1], norm=norm)
@@ -91,14 +114,32 @@ class UNet(nn.Module):
         self.up4 = Up(features[1], features[0], features[0], norm=norm)
         self.out = nn.Conv2d(features[0], out_ch, kernel_size=1)
 
+    def _down(self, down, x):
+        # 只 checkpoint DoubleConv，池化很便宜；feat 作为 skip 仍会保留
+        if self.use_checkpoint and self.training:
+            feat = _checkpointed(down.conv, x)
+        else:
+            feat = down.conv(x)
+        return down.pool(feat), feat
+
+    def _up(self, up, x, skip):
+        # checkpoint 整个 Up：重算 ConvTranspose + concat + DoubleConv，
+        # 相比只包 conv 能省掉全分辨率 concat 的激活
+        if self.use_checkpoint and self.training:
+            return _checkpointed2(up, x, skip)
+        return up(x, skip)
+
     def forward(self, x):
-        p1, s1 = self.down1(x)      # skip 特征 [64]（池化前，全分辨率）
-        p2, s2 = self.down2(p1)
-        p3, s3 = self.down3(p2)
-        p4, s4 = self.down4(p3)
-        x = self.bottleneck(p4)
-        x = self.up1(x, s4)
-        x = self.up2(x, s3)
-        x = self.up3(x, s2)
-        x = self.up4(x, s1)
+        p1, s1 = self._down(self.down1, x)   # skip 特征 [64]（池化前，全分辨率）
+        p2, s2 = self._down(self.down2, p1)
+        p3, s3 = self._down(self.down3, p2)
+        p4, s4 = self._down(self.down4, p3)
+        if self.use_checkpoint and self.training:
+            x = _checkpointed(self.bottleneck, p4)
+        else:
+            x = self.bottleneck(p4)
+        x = self._up(self.up1, x, s4)
+        x = self._up(self.up2, x, s3)
+        x = self._up(self.up3, x, s2)
+        x = self._up(self.up4, x, s1)
         return self.out(x)

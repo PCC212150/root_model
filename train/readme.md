@@ -152,6 +152,10 @@ torchrun --nproc_per_node=3 train/train.py \
 - 参数量 **31.04M**；无预训练。
 - 显存参考（本机 batch1，1024×1536）：约 4~5GB；3090 上 `--size 1536 --batch 4` 实测约 18GB。
 - 单卡 batch=1 + `--norm batch` 会欠分割，用 batch≥2 或 DDP。
+- **2736 + `--norm group` 单卡 24GB 会 OOM**（本机实测峰值约 23.4GB，正好卡在 24GB 上限）；
+  加 `--unet-checkpoint` 对编码器/瓶颈/解码器做梯度检查点后峰值约 17GB，
+  可在一张 3090 上跑 2736（慢约 20~30%）。只对 `--arch unet` 生效；
+  **必须配 `--norm group`**，BatchNorm 在检查点重算时会二次更新 running stats。
 
 ### 2.2 `--arch unet++`（嵌套跳跃连接）
 
@@ -502,6 +506,7 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 | `--val-size N` | 验证集数量：image 模式是**样本数**；plant 模式是**植株数**（默认 config.VAL_SIZE） |
 | `--val-frac 0.2` | image 模式下验证集比例（默认 0.2；`--val-size` 未指定时生效） |
 | `--split-mode image` | train/val 划分方式：默认**单图随机**（忽略 VAL_PLANTS，同株可能跨侧）；`plant` 才按植株整组 |
+| `--unet-checkpoint` | U-Net 编码器/瓶颈/解码器梯度检查点；2736 + group norm 在 24GB 上 OOM 时用，慢 20~30%；必须配 `--norm group` |
 | `--unetpp-checkpoint` | UNet++ 嵌套节点梯度检查点；1536 显存不够时用，慢 20~30%，配 `--norm group` |
 | `--patience` / `--lr-patience` | 早停 / 降 LR 的耐心轮数 |
 | `--gpu N` | 单进程指定卡；DDP 用 `CUDA_VISIBLE_DEVICES` |

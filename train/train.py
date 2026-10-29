@@ -379,6 +379,10 @@ def parse_args():
                    help="关闭 VM-UNet 每个 VSS block 的梯度检查点。默认开启："
                         "1536 下不检查点会保存整条 selective-scan 的中间状态，"
                         "24GB 也会 OOM")
+    p.add_argument("--unet-checkpoint", action="store_true",
+                   help="U-Net 编解码块启用梯度检查点：2736 + GroupNorm 在 24GB 上 "
+                        "OOM 时用（用时间换显存，约慢 20~30%%；只对 --arch unet 生效；"
+                        "请配 --norm group，BatchNorm 在重算时会二次更新 running stats）")
     p.add_argument("--unetpp-checkpoint", action="store_true",
                    help="UNet++ 嵌套节点启用梯度检查点：1536/batch1 显存不够时用"
                         "（用时间换显存，约慢 20~30%%；只对 --arch unet++ 生效）")
@@ -779,7 +783,8 @@ def main():
                          use_checkpoint=not args.vmunet_no_checkpoint,
                          chunk=args.vmunet_chunk)
     else:
-        model = UNet(in_ch=3, out_ch=model_out_ch, norm=args.norm)
+        model = UNet(in_ch=3, out_ch=model_out_ch, norm=args.norm,
+                     use_checkpoint=args.unet_checkpoint)
     # 只在 CUDA 上换 SyncBN：CPU/gloo 下 torch 会直接报
     # "SyncBatchNorm layers only work with GPU modules"
     if ddp.enabled and args.norm == "batch" and device.type == "cuda":
