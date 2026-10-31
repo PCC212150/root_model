@@ -210,8 +210,9 @@ def run_gt_box(backend, image, gt, args):
         if crop.size == 0:
             continue
         backend.set_image(crop)
-        out = backend.predict(box=pr.box, points=pr.points, labels=pr.labels,
-                              multimask_output=args.multimask)
+        box_arg = None if args.points_only else pr.box
+        out = backend.predict(box=box_arg, points=pr.points, labels=pr.labels,
+                              multimask_output=args.multimask or args.points_only)
         idx = select_mask(out, pr.box)
         if idx is None:
             continue
@@ -244,8 +245,9 @@ def run_skeleton(backend, image, gt, sem, args):
         backend.set_image(crop)
         points = None if args.gt_box_only else pr.points
         labels = None if args.gt_box_only else pr.labels
-        out = backend.predict(box=pr.box, points=points, labels=labels,
-                              multimask_output=args.multimask)
+        box_arg = None if args.points_only else pr.box
+        out = backend.predict(box=box_arg, points=points, labels=labels,
+                              multimask_output=args.multimask or args.points_only)
         idx = select_mask(out, pr.box)
         if idx is None:
             continue
@@ -462,6 +464,8 @@ def parse_args(argv=None):
                    help="把 SAM 输出裁到 prompt box 内（gt_box 建议开）")
     p.add_argument("--multimask", action="store_true",
                    help="SAM 输出多候选并按 score/box IoU 选（默认单 mask）")
+    p.add_argument("--points-only", action="store_true",
+                   help="gt_box/skeleton 只用点提示，不传 box（会自动开 multimask）")
     p.add_argument("--text-tile", type=int, default=1008)
     p.add_argument("--text-overlap", type=int, default=256)
     p.add_argument("--text-prompts", default="sugarcane root",
@@ -472,6 +476,8 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.prompt == "text" and args.backend != "sam3":
         p.error("--prompt text 只支持 --backend sam3")
+    if args.points_only and args.backend == "sam3":
+        p.error("SAM3 适配器不支持单独点提示；请去掉 --points-only")
     if args.score_thresh is None:
         args.score_thresh = 0.5 if args.prompt == "text" else 0.0
     if args.nms_iou is None:
