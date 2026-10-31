@@ -605,8 +605,9 @@ def skeleton_prompts(pred_mask: np.ndarray, image: np.ndarray, *, spur=None,
     st = analyze_mask_ex(pred_mask, spur=spur, min_len=min_len,
                          with_paths=True, spacing=spacing,
                          normalize_count=True)
+    all_paths = [np.asarray(p, dtype=np.float64) for p in st.get("paths", [])]
     prompts = []
-    for idx, path in enumerate(st.get("paths", [])):
+    for idx, path in enumerate(all_paths):
         pts = np.asarray(path, dtype=np.float64)
         if len(pts) < 2:
             continue
@@ -627,14 +628,44 @@ def skeleton_prompts(pred_mask: np.ndarray, image: np.ndarray, *, spur=None,
         label_list = [np.ones(len(p), dtype=np.int64)] if p is not None and len(p) else []
         if max_negatives > 0:
             x0, y0, x1, y1 = origin
-            bg = ~pred_mask[y0:y1, x0:x1]
-            ys, xs = np.nonzero(bg)
-            if len(xs):
-                take = np.linspace(0, len(xs) - 1,
-                                   min(max_negatives, len(xs))).round().astype(int)
-                neg = np.stack([xs[take], ys[take]], axis=1).astype(np.float32)
+            neg_list = []
+            # 1) 优先用「别的骨架」上的点做负样本，抑制 SAM 把邻近根并进来
+            for j, other in enumerate(all_paths):
+                if j == idx or len(other) < 2:
+                    continue
+                q = _clip_points(other, origin, crop.shape)
+                if q is None or len(q) == 0:
+                    continue
+                inside = ((q[:, 0] >= 0) & (q[:, 0] < crop.shape[1])
+                          & (q[:, 1] >= 0) & (q[:, 1] < crop.shape[0]))
+                q = q[inside]
+                if len(q) == 0:
+                    continue
+                # 交叉点附近的“别的根”可能就在目标根上，跳过太近的点
+                d = _point_to_polyline_dist(q, pts)
+                q = q[d > 3.0]
+                if len(q):
+                    neg_list.append(q)
+            if neg_list:
+                cand = np.concatenate(neg_list, axis=0)
+                take = np.linspace(0, len(cand) - 1,
+                                   min(max_negatives, len(cand))).round().astype(int)
+                neg = cand[np.unique(take)].astype(np.float32)
                 point_list.append(neg)
                 label_list.append(np.zeros(len(neg), dtype=np.int64))
+            # 2) 不够再用背景点补齐
+            have = sum(len(a) for a in label_list if a is not None
+                       and len(a) and a[0] == 0)
+            if have < max_negatives:
+                bg = ~pred_mask[y0:y1, x0:x1]
+                ys, xs = np.nonzero(bg)
+                if len(xs):
+                    need = max_negatives - have
+                    take = np.linspace(0, len(xs) - 1,
+                                       min(need, len(xs))).round().astype(int)
+                    neg = np.stack([xs[take], ys[take]], axis=1).astype(np.float32)
+                    point_list.append(neg)
+                    label_list.append(np.zeros(len(neg), dtype=np.int64))
         prompts.append(Prompt(
             crop_box=origin, box=box,
             points=np.concatenate(point_list, axis=0) if point_list else None,

@@ -226,7 +226,9 @@ def run_skeleton(backend, image, gt, sem, args):
         if crop.size == 0:
             continue
         backend.set_image(crop)
-        out = backend.predict(box=pr.box, points=pr.points, labels=pr.labels,
+        points = None if args.gt_box_only else pr.points
+        labels = None if args.gt_box_only else pr.labels
+        out = backend.predict(box=pr.box, points=points, labels=labels,
                               multimask_output=False)
         idx = select_mask(out, pr.box)
         if idx is None:
