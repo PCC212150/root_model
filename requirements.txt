@@ -7,3 +7,5 @@ torchvision
 numpy
 pillow
 scikit-image
+# SAM 实例评测可选依赖（语义训练不需要；SAM2/SAM3 需要）：
+# timm>=1.0.17 hydra-core omegaconf iopath ftfy==6.1.1 regex huggingface_hub

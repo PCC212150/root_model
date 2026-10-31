@@ -469,6 +469,39 @@ python tool/nnunet/eval_predictions.py ...              # 用项目自己的指�
 
 ---
 
+## 2.11 SAM 系列零样本实例分割（独立评测线）
+
+`--arch sam/sam2/sam3/medsam` 是**语义**用法：只保留图像编码器 + 监督解码头，
+不是 promptable SAM。要看原生实例分割，用独立脚本：
+
+```bash
+# 只检查逐根 GT（不加载模型）
+python tool/sam_instance_eval.py --check-gt \
+  --data-dir datasets/root/test/GT --out-dir result/instance_eval/gt_check
+
+# oracle：GT 框逐根提示
+python tool/sam_instance_eval.py --prompt gt_box --backend sam \
+  --limit-images 1 --limit-instances 5 \
+  --out-dir result/instance_eval/smoke_gtbox_sam
+
+# 可部署：语义模型 -> skeleton -> SAM 精修
+python tool/sam_instance_eval.py --prompt skeleton --backend sam2 \
+  --semantic-model model_202610291403 \
+  --out-dir result/instance_eval/full_skeleton_sam2
+
+# 零样本文本：SAM3，按 1008 tile
+python tool/sam_instance_eval.py --prompt text --backend sam3 \
+  --text-prompts "sugarcane root" \
+  --out-dir result/instance_eval/full_text_sam3
+```
+
+口径：一条 root linestrip = 一个实例；polygon 碎片按几何归到最近中心线，
+再与 `masks/<stem>.png` 求交。当前测试集是 288 条 linestrip / 316 个 polygon，
+所以实例 AP 的 288 与 `test/test.py` 的“GT根数”316 不是同一个数。
+`skeleton` 模式必须用当前 55/14 split 训出的模型（默认 `model_202610291403`），
+不要用旧 split 的 `model_202610241541`（当前测试集里有 8 张它见过）。
+详见 `tool/sam_instance_eval.py` 顶部说明和 `common/instance.py`。
+
 ## 3. 一页速查
 
 | `--arch` | 全卷积 | 尺寸约束 | `--crop` | 预训练（默认） | 参数量（总/可训练） | 1024×1536 峰值* |

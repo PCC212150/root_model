@@ -34,6 +34,8 @@ ROOT_LABEL = "root"
 # **填充**画（见 dataset.build_target_masks），不是描一条 10px 宽的线。
 ROOT_SHAPE_TYPES = ("linestrip", "line", "polygon")
 ROOT_FILLED_TYPES = ("polygon",)
+# 实例评测用：中心线（linestrip/line）与轮廓（polygon）分开保留。
+ROOT_LINE_TYPES = ("linestrip", "line")
 
 # 「root 的多边形与折线同名并存」的告警只提醒一次（见 parse_other 里的说明）
 _warned_mixed_root = False
@@ -190,3 +192,73 @@ def parse_other(json_path, image_size=None, verbose: bool = True) -> OtherLabels
 
 def _union(a, b) -> tuple:
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+@dataclass
+class RootShapes:
+    """一张图的 root 中心线与轮廓，按 JSON 出现顺序保留。
+
+    与 OtherLabels 的区别：OtherLabels.roots 在“有多边形”时只保留多边形
+    （训练掩码的权威口径）；实例评测需要**同时**拿到中心线和多边形，
+    再把多边形碎片归到最近的中心线。
+    """
+
+    path: Path = None
+    lines: list = field(default_factory=list)       # [[(x, y), ...], ...]，>=2 点
+    polygons: list = field(default_factory=list)    # [[(x, y), ...], ...]，>=3 点
+    order: list = field(default_factory=list)       # [("line", i) | ("polygon", j), ...]
+    info: dict = field(default_factory=dict)        # n_lines / n_polygons / warns
+
+
+def parse_root_shapes(json_path, image_size=None, verbose: bool = False) -> RootShapes:
+    """解析 labelme JSON 里**所有** root 中心线和多边形。
+
+    这是 `parse_other()` 的增量入口，不改变后者“有多边形就只取多边形”的
+    训练口径。root 的 shape_type 处理与 parse_other 保持一致：polygon 填充，
+    其它（linestrip/line/未知）按中心线；少于 2 点（线）或 3 点（多边形）丢弃。
+    """
+    json_path = Path(json_path)
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data.pop("imageData", None)          # 与 parse_other 一样，解析后立刻丢弃
+
+    out = RootShapes(path=json_path)
+    warns = []
+
+    if image_size is not None:
+        w, h = int(image_size[0]), int(image_size[1])
+        jw, jh = data.get("imageWidth"), data.get("imageHeight")
+        if jw is not None and jh is not None and (int(jw), int(jh)) != (w, h):
+            raise ValueError(
+                f"{json_path.name}: 标注尺寸 {int(jw)}x{int(jh)} 与图片实际尺寸 "
+                f"{w}x{h} 不一致，掩码会整体错位。请重新导出/导出后再标注。")
+
+    for s in data.get("shapes") or []:
+        label = (s.get("label") or "").strip()
+        if label != ROOT_LABEL:
+            continue
+        pts = _finite_points(s.get("points"))
+        st = (s.get("shape_type") or "").strip()
+        if st in ROOT_FILLED_TYPES:
+            if len(pts) >= 3:
+                out.order.append(("polygon", len(out.polygons)))
+                out.polygons.append(pts)
+            else:
+                warns.append(f"root polygon 只有 {len(pts)} 个点，忽略")
+        else:
+            if st not in ROOT_LINE_TYPES:
+                warns.append(f"root 的 shape_type={st!r} 不是折线/多边形，按折线读取")
+            if len(pts) >= 2:
+                out.order.append(("line", len(out.lines)))
+                out.lines.append(pts)
+            else:
+                warns.append(f"root 折线只有 {len(pts)} 个点，忽略")
+
+    out.info = {
+        "n_lines": len(out.lines),
+        "n_polygons": len(out.polygons),
+        "warns": warns,
+    }
+    if verbose and warns:
+        print(f"[实例标注告警] {json_path.name}: " + "；".join(sorted(set(warns))))
+    return out
