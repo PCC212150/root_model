@@ -100,6 +100,19 @@ def box_iou(a, b) -> float:
     return inter / max(ua + ub - inter, 1e-12)
 
 
+def clip_mask_to_box(mask, box):
+    """把 crop 内 mask 限制在 prompt box 内；box 是 crop 坐标 xyxy。"""
+    m = np.asarray(mask, dtype=bool)
+    h, w = m.shape
+    x0, y0, x1, y1 = [int(round(float(v))) for v in box]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    out = np.zeros_like(m)
+    if x1 > x0 and y1 > y0:
+        out[y0:y1, x0:x1] = m[y0:y1, x0:x1]
+    return out
+
+
 def select_mask(out, prompt_box):
     masks = out.get("masks")
     if masks is None or len(masks) == 0:
@@ -198,12 +211,15 @@ def run_gt_box(backend, image, gt, args):
             continue
         backend.set_image(crop)
         out = backend.predict(box=pr.box, points=pr.points, labels=pr.labels,
-                              multimask_output=False)
+                              multimask_output=args.multimask)
         idx = select_mask(out, pr.box)
         if idx is None:
             continue
+        m = out["masks"][idx]
+        if args.clip_to_prompt_box:
+            m = clip_mask_to_box(m, pr.box)
         score = float(out["scores"][idx]) if len(out["scores"]) else 0.0
-        pred = pred_from_crop_mask(out["masks"][idx], (x0, y0), score, "gt_box",
+        pred = pred_from_crop_mask(m, (x0, y0), score, "gt_box",
                                    meta={"prompt_instance": pr.meta.get("instance_id"),
                                          "prompt_variant": "gt_box"})
         if pred is not None:
@@ -229,11 +245,13 @@ def run_skeleton(backend, image, gt, sem, args):
         points = None if args.gt_box_only else pr.points
         labels = None if args.gt_box_only else pr.labels
         out = backend.predict(box=pr.box, points=points, labels=labels,
-                              multimask_output=False)
+                              multimask_output=args.multimask)
         idx = select_mask(out, pr.box)
         if idx is None:
             continue
         m = out["masks"][idx]
+        if args.clip_to_prompt_box:
+            m = clip_mask_to_box(m, pr.box)
         if args.clip_to_pred_mask:
             m = m & pred_mask[y0:y1, x0:x1]
         score = float(out["scores"][idx]) if len(out["scores"]) else 0.0
@@ -440,6 +458,10 @@ def parse_args(argv=None):
                    default=True)
     p.add_argument("--gt-box-only", action="store_true",
                    help="gt_box/skeleton 只用框，不加点提示")
+    p.add_argument("--clip-to-prompt-box", action="store_true",
+                   help="把 SAM 输出裁到 prompt box 内（gt_box 建议开）")
+    p.add_argument("--multimask", action="store_true",
+                   help="SAM 输出多候选并按 score/box IoU 选（默认单 mask）")
     p.add_argument("--text-tile", type=int, default=1008)
     p.add_argument("--text-overlap", type=int, default=256)
     p.add_argument("--text-prompts", default="sugarcane root",
